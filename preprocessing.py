@@ -1,0 +1,286 @@
+import numpy as np
+import torch
+from scipy.stats import boxcox
+from sklearn.preprocessing import QuantileTransformer
+
+
+SIGNEDLOG_QUANTILE = 0.01   # default scale: the 1% quantile of |x| on the train pool
+AMP_STD_FLOOR = 1e-6        # the floor of a target's standardization std (preprocess_amplitude)
+
+
+def resolve_amp_trafos(trafos, amplitude, scale_quantile=SIGNEDLOG_QUANTILE, sign_data=None,
+                       sign_head=False, scale_shift=0.0):
+    """Swap 'log' -> 'signedlog:<s>' when the amplitude contains non-positive values.
+
+    Plain log is undefined for x <= 0 (e.g. virtual corrections or virt/born ratios
+    that go negative).  signedlog, f(x) = sgn(x) * log(1 + |x|/s), is total and
+    invertible (inverse s * sgn(y) * (exp(|y|) - 1)).  The scale s is the
+    `scale_quantile` quantile of the nonzero |x| of the data the transform is
+    resolved on (the train pool), written into the transform string so it travels
+    with `amp_trafos` (frozen stats, config dump) and the inverse reads it back.
+    `scale_quantile=None` is the legacy resolution (bare 'signedlog', s = 1), used
+    to reproduce runs whose frozen stats predate the scale.  `sign_data`, when given,
+    is what decides positive vs signed (e.g. every role of the process concatenated):
+    a subsampled train pool of a pool with rare negative events can hold none, resolve
+    to the plain log, and the inverse then meets a negative value in validation.
+    Without it the transform is linear below |x| = 1, and a signed one-loop pool
+    whose median |x| is 1e-5 over tens of decades standardizes to a kurtosis of
+    thousands.  The caller must store the returned list and use it for BOTH the
+    forward preprocessing and the inverse.  Positive-only data keeps plain 'log'.
+    `sign_head=True` resolves a signed pool to 'abslog:<s>' instead, f(x) = log(max(|x|, s)):
+    the magnitude alone, with the sign carried by a separate classification target
+    (training.sign_head); the inverse returns |x| and the caller applies the sign.
+    `scale_shift` (nat, data.signedlog_scale_shift) moves a signedlog scale off its quantile, s -> s exp(shift):
+    the signed pools' A/B (docs/results.tex, the candidate targets: r0 three nats below the pool's level, shift -3);
+    the shifted s is what the transform string carries, so the inverse and frozen stats need nothing else.
+    """
+    if not trafos or "log" not in trafos:
+        return list(trafos) if trafos else trafos
+    if float(np.min(amplitude if sign_data is None else sign_data)) > 0.0:
+        return list(trafos)
+    if scale_quantile is None:
+        return ["signedlog" if t == "log" else t for t in trafos]
+    a = np.abs(np.asarray(amplitude, dtype=np.float64)).ravel()
+    a = a[a > 0]
+    s = float(np.quantile(a, scale_quantile)) if a.size else 1.0
+    if not np.isfinite(s) or s <= 0.0:
+        s = 1.0
+    # the abslog floor is the sign head's own convention (its 1% quantile): a shift there would be another design
+    assert not (sign_head and scale_shift), "scale_shift is for the signedlog target, not the sign head's abslog floor"
+    s *= float(np.exp(scale_shift))
+    kind = "abslog" if sign_head else "signedlog"
+    return [f"{kind}:{s:.6e}" if t == "log" else t for t in trafos]
+
+
+def unresolved_amp_trafos(trafos):
+    """The configured transform list a resolved one came from: 'signedlog[:<s>]' and 'abslog:<s>' back to 'log'
+    (resolve_amp_trafos only ever writes them in place of 'log')."""
+    return [("log" if str(t) == "signedlog" or str(t).startswith(("signedlog:", "abslog:")) else t)
+            for t in trafos] if trafos else trafos
+
+
+def signedlog_scale(fn_str):
+    """Scale s of a 'signedlog' / 'signedlog:<s>' transform string (1.0 if absent)."""
+    if fn_str == "signedlog":
+        return 1.0
+    if fn_str.startswith("signedlog:") or fn_str.startswith("abslog:"):
+        return float(fn_str.split(":", 1)[1])
+    raise ValueError(f"Not a signedlog/abslog transform: {fn_str}")
+
+
+def preprocess_amplitude(amplitude, trafos=None, mean=None, std=None):
+    """Forward amplitude preprocessing.
+
+    If `mean`/`std` are given, the standardization step uses them instead of
+    computing fresh statistics. This lets val/test be transformed with the
+    *frozen, train-only* statistics (recipe data path) rather than leaking their
+    own distribution into the normalization.
+    """
+    out_mean, out_std = 0, 0
+    if trafos:
+        for fn_str in trafos:
+            if (
+                fn_str == "standardization"
+            ):  # treat "standardize" separately because we need to save stds and means
+                if mean is not None and std is not None:
+                    amplitude = (amplitude - mean) / std
+                    out_mean, out_std = mean, std
+                else:
+                    # the std floored at AMP_STD_FLOOR: a target constant up to rounding (e+e- -> q q~ massless at
+                    # mu^2 = s over its Born is C_F times a number, plan virtual_over_born) has a std of ~5e-13 (the June 2026 datasets), and
+                    # dividing by it turns rounding noise into a unit-variance target nothing can learn (the June 2026
+                    # V/B runs). In the transformed units (log|M|^2 in nat) a spread below 1e-6 carries nothing a fit
+                    # could use; every real pool's std is O(1), so nothing else changes.
+                    out_mean = amplitude.mean(axis=0)
+                    out_std = np.maximum(amplitude.std(axis=0), AMP_STD_FLOOR)
+                    amplitude = (amplitude - out_mean) / out_std
+            else:
+                fn = get_fn(fn_str)
+                amplitude = fn(amplitude, None)
+    assert np.isfinite(amplitude).all()
+    return amplitude, out_mean, out_std
+
+
+def undo_preprocess_amplitude(amplitude, mean, std, trafos=None):
+    if trafos:
+        trafos = trafos[::-1] # reverse order of trafos
+        for fn_str in trafos:
+            if fn_str == "standardization":
+                amplitude = amplitude * std + mean
+            else:
+                inv_fn = get_inv_fn(fn_str)
+                amplitude = inv_fn(amplitude, None)
+
+            assert np.isfinite(amplitude).all(), f'{fn_str} failed'
+
+    return amplitude
+
+
+def preprocess_particles(
+    particles_raw,
+    type_tokens,
+    trafos=None,
+    incl_fvs=True,
+    mean=None,
+    std=None,
+    eps_std=1e-2,
+    return_dict=False,
+):
+    assert np.isfinite(particles_raw).all()
+
+    feature_sets = {}
+    if trafos:
+        for t_name, t_fns in trafos.items():
+            if not t_fns:  # skip empty transformation lists
+                continue
+            transformed_features = particles_raw
+            for fn_str in t_fns:
+                fn = get_fn(fn_str)
+                transformed_features = fn(transformed_features, type_tokens)
+            feature_sets[t_name] = transformed_features
+
+    if incl_fvs:
+        feature_sets["fvs_raw"] = sort_particles(particles_raw, type_tokens, "E")
+        feature_sets["fvs_raw"] /= np.max(
+            np.abs(feature_sets["fvs_raw"][:, ::4])
+        )  # normalize by max energy of particles
+        # feature_sets["fvs_raw"] = particles_raw
+        
+    if return_dict:
+        return feature_sets
+    else:
+        return np.concatenate(list(feature_sets.values()), axis=1)
+
+
+def standardization(features, return_mean_std=False, clip=True):
+    """standardize features"""
+    mean = features.mean(axis=0)
+    std = features.std(axis=0)
+    if clip:
+        std = np.clip(std, a_min=1e-6, a_max=None)  # avoid std=0.
+    features = (features - mean) / std
+    assert np.isfinite(features).all()
+    if return_mean_std:
+        return features, mean, std
+    else:
+        return features
+
+
+def compute_invariants(particles, eps=1e-4, incl_diag_invariants=False, reshape=True):
+    """compute Lorentz invariants out of four-vectors"""
+    if reshape:
+        ps = particles.reshape(particles.shape[0], particles.shape[1] // 4, 4)
+    else:
+        ps = particles
+
+    # compute matrix of all inner products
+    def inner_product(p1, p2):
+        return p1[..., 0] * p2[..., 0] - (p1[..., 1:] * p2[..., 1:]).sum(axis=-1)
+
+    if incl_diag_invariants:
+        offset = 0
+    else:
+        offset = 1
+
+    idxs = np.triu_indices(ps.shape[-2], k=offset)
+    invariants = inner_product(ps[..., idxs[0], :], ps[..., idxs[1], :])
+    if type(invariants) == np.ndarray:
+        invariants = np.clip(invariants, a_min=eps, a_max=None)
+    else:
+        invariants = torch.clip(invariants, eps, None)
+    return invariants
+
+
+def sort_particles(particles, type_tokens, sort_key):
+    """sort particles according to some property"""
+    ps = particles.reshape(particles.shape[0], particles.shape[1] // 4, 4)
+    particle_types = np.unique(type_tokens)
+    sorted_ps = []
+    for particle_type in particle_types:
+        mask = type_tokens == particle_type
+        # sort according to energy, which is the first entry of the four-vector
+        match sort_key:
+            case "E":
+                sorted_indices = np.argsort(ps[:, mask][:, :, 0])
+            case "pt":
+                pts = np.linalg.norm(ps[:, mask][:, :, 1:3], axis=-1)
+                sorted_indices = np.argsort(pts)
+            case _:
+                raise ValueError(f"Unknown sort key {sort_key}")
+        sorted_ps.append(
+            np.take_along_axis(ps[:, mask], sorted_indices[:, :, np.newaxis], axis=1)
+        )
+    return np.concatenate(sorted_ps, axis=1).reshape(particles.shape)
+
+
+def apply_boxcox(particles):
+    ps = particles.transpose()
+    res = np.zeros(ps.shape)
+    for i in range(ps.shape[0]):
+        try:
+            res[i] = boxcox(ps[i])[0]
+        except:
+            res[i] = ps[i]
+    return res.transpose()
+
+
+def apply_quantile_transform(particles):
+    return QuantileTransformer(output_distribution="normal").fit_transform(particles)
+
+
+def get_fn(fn_str):
+    # get functions from string
+    if fn_str.startswith("signedlog"):
+        s = signedlog_scale(fn_str)
+        return lambda p, t: np.sign(p) * np.log1p(np.abs(p) / s)
+    if fn_str.startswith("abslog:"):
+        s = signedlog_scale(fn_str)
+        return lambda p, t: np.log(np.maximum(np.abs(p), s))
+    match fn_str:
+        case "None":
+            return lambda p, t: p
+        case "log":
+            return lambda p, t: np.log(p)
+        case "exp":
+            return lambda p, t: np.exp(p)
+        case "sqrt":
+            return lambda p, t: np.sqrt(p)
+        case "inverse":
+            return lambda p, t: 1 / p
+        case "boxcox":
+            return lambda p, t: apply_boxcox(p)
+        case "quantile_transform":
+            return lambda p, t: apply_quantile_transform(p)
+        case "invs":
+            return lambda p, t: compute_invariants(p)
+        case "standardization":
+            return lambda p, t: standardization(p)
+        case "sort_E":
+            return lambda p, t: sort_particles(p, t, "E")
+        case "sort_pt":
+            return lambda p, t: sort_particles(p, t, "pt")
+        case _:
+            raise ValueError(f"Unknown transformation function {fn_str}")
+
+
+def get_inv_fn(fn_str):
+    # get inverse functions from string. The exponentials clamp their ARGUMENT so a
+    # prediction far outside a pool's range stays finite (a raw-space inf tripped the
+    # finiteness assert in undo_preprocess_amplitude and aborted evaluation); the
+    # raw-space metrics of such an event are then merely wrong, not fatal.
+    if fn_str.startswith("signedlog"):
+        s = signedlog_scale(fn_str)
+        return lambda p, t: s * np.sign(p) * np.expm1(np.minimum(np.abs(p), 80.0))
+    if fn_str.startswith("abslog:"):
+        return lambda p, t: np.exp(np.minimum(p, 80.0))      # the magnitude; sign applied by the caller
+    match fn_str:
+        case "log":
+            return lambda p, t: np.exp(np.minimum(p, 80.0))
+        case "exp":
+            return lambda p, t: np.log(p)
+        case "sqrt":
+            return lambda p, t: p**2
+        case "inverse":
+            return lambda p, t: 1 / p
+        case _:
+            raise ValueError(f"Unknown inverse transformation function {fn_str}")

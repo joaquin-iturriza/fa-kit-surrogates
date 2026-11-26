@@ -1,0 +1,935 @@
+import re
+
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.backends.backend_pdf import PdfPages
+from scipy.stats import norm
+
+from base_plots import plot_loss, plot_mse
+
+
+def short_ds_name(name: str) -> str:
+    """Compact a dataset name for titles/legends.
+
+    'ee_wwz_255-1000GeV_amplitudes' -> 'ee_wwz_255'.  Strips the trailing
+    '_amplitudes' and drops the common upper energy bound '-<N>GeV'; keeps the
+    'ee_' process prefix.
+    """
+    s = str(name)
+    if s.endswith("_amplitudes"):
+        s = s[: -len("_amplitudes")]
+    s = re.sub(r"-\d+GeV", "", s)
+    return s
+
+#plt.rcParams["font.family"] = "serif"
+#plt.rcParams["font.serif"] = "Charter"
+plt.rcParams["text.usetex"] = False
+#plt.rcParams["text.latex.preamble"] = (
+#    r"\usepackage[bitstream-charter]{mathdesign} \usepackage{amsmath} \usepackage{siunitx}"
+#)
+
+FONTSIZE = 14
+FONTSIZE_LEGEND = 13
+FONTSIZE_TICK = 12
+
+colors = ["black", "#0343DE", "#A52A2A", "darkorange"]
+
+
+def plot_loss_vs_compute(
+    file,
+    losses,
+    computes,
+    labels,
+    title=None,
+    losses_no_reg=None,
+    computes_no_reg=None,
+    labels_no_reg=None,
+    val_step=1,
+    solo_ref=None,
+):
+    """Per-dataset loss on log-log axes, stacked: top vs global iteration,
+    bottom vs that dataset's own cumulative compute (samples seen from it).
+
+    losses[i] and computes[i] are aligned arrays for dataset i (same length,
+    one entry per validation step).  The two panels make explicit the gap
+    between loss-vs-global-step (what the EMA plot shows) and
+    loss-vs-per-process-compute (what the balanced sampler fits α on).
+
+    solo_ref[i] = (a, b) of the dataset's solo scaling fit, L_solo(c)=exp(a+b·log c);
+    when given, the solo curve is overlaid (dotted) on the vs-compute panel over the
+    dataset's compute range, so you can read directly how far each process sits above
+    its solo scaling (and whether its slope matches the solo exponent −b).
+    """
+    fig, (ax_it, ax_c) = plt.subplots(2, 1, figsize=(7, 9))
+
+    def _draw(ax, xs, ys, label, ci, dashed=False):
+        x = np.asarray(xs, dtype=float)
+        y = np.asarray(ys, dtype=float)
+        m = (x > 0) & (y > 0)
+        ax.plot(
+            x[m], y[m], label=label, color=f"C{ci}",
+            linestyle="--" if dashed else "-", alpha=0.7 if dashed else 1.0,
+        )
+
+    for i, (loss, label) in enumerate(zip(losses, labels)):
+        it = np.arange(1, len(loss) + 1) * val_step
+        _draw(ax_it, it, loss, label, i)
+        _draw(ax_c, computes[i], loss, label, i)
+        # overlay the solo scaling line on the compute panel
+        if solo_ref is not None and i < len(solo_ref) and solo_ref[i] is not None:
+            a, b = solo_ref[i]
+            c = np.asarray(computes[i], dtype=float)
+            c = c[c > 0]
+            if len(c):
+                cg = np.geomspace(c.min(), c.max(), 50)
+                ax_c.plot(cg, np.exp(a + b * np.log(cg)), color=f"C{i}",
+                          linestyle=":", linewidth=1.4, alpha=0.9)
+
+    if losses_no_reg is not None:
+        for i, (loss, label) in enumerate(zip(losses_no_reg, labels_no_reg)):
+            it = np.arange(1, len(loss) + 1) * val_step
+            _draw(ax_it, it, loss, label, i, dashed=True)
+            _draw(ax_c, computes_no_reg[i], loss, label, i, dashed=True)
+
+    for ax in (ax_it, ax_c):
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_ylabel("Loss", fontsize=FONTSIZE)
+        ax.grid(True, which="both", linewidth=0.4, alpha=0.4)
+    ax_it.set_xlabel("Iteration (global)", fontsize=FONTSIZE)
+    ax_it.set_title("vs global iteration", fontsize=FONTSIZE)
+    ax_c.set_xlabel("Samples seen from this dataset (compute)", fontsize=FONTSIZE)
+    ax_c.set_title("vs per-dataset compute", fontsize=FONTSIZE)
+
+    handles, leg_labels = ax_it.get_legend_handles_labels()
+    if handles:
+        fig.legend(
+            handles, leg_labels,
+            loc="upper center", bbox_to_anchor=(0.5, -0.01),
+            ncol=min(len(leg_labels), 4), frameon=False, fontsize=FONTSIZE_LEGEND,
+        )
+    if title:
+        fig.suptitle(title, fontsize=FONTSIZE + 1, y=1.02)
+    fig.tight_layout()
+    fig.savefig(file, format="pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_mixer(cfg, plot_path, title, plot_dict):
+    # plotting.sigma_only: the het sigma stage, where mu is the main run's (frozen) and only sigma changes: draw the
+    # loss curve and the sigma and pull plots, not the truth/prediction histograms, per-process pages and Delta plots,
+    # which would repeat the main run's (2026-10-22)
+    sigma_only = bool(cfg.plotting.get("sigma_only", False))
+    """Dispatch all requested plots based on cfg flags."""
+ 
+    if cfg.plotting.loss and cfg.train:
+        logy = cfg.plotting.get("loss_log_scale", True)
+ 
+        # ── primary loss curves ───────────────────────────────────────────────
+        losses = [plot_dict["train_loss"], plot_dict["val_loss"]]
+        labels = ["train loss", "val loss"]
+ 
+        # ── optional: loss without regularization ────────────────────────────
+        losses_no_reg = None
+        labels_no_reg = None
+        if cfg.plotting.get("plot_without_regularization", False):
+            losses_no_reg = [
+                plot_dict.get("train_loss_no_reg", []),
+                plot_dict.get("val_loss_no_reg", []),
+            ]
+            labels_no_reg = ["train loss (no reg)", "val loss (no reg)"]
+ 
+        loss_title = title[0] if isinstance(title, list) else title
+        plot_loss(
+            file=f"{plot_path}/loss.pdf",
+            losses=losses,
+            lr=plot_dict["train_lr"],
+            labels=labels,
+            logy=logy,
+            title=loss_title,
+            losses_no_reg=losses_no_reg,
+            labels_no_reg=labels_no_reg,
+        )
+ 
+        val_step = plot_dict.get("validate_every_n_steps", 1)
+
+        # ── optional: per-process val loss curves ────────────────────────────
+        proc_val_losses = plot_dict.get("proc_val_losses", {})
+        if proc_val_losses:
+            proc_losses_list  = list(proc_val_losses.values())
+            proc_labels_list  = [short_ds_name(name) for name in proc_val_losses]
+            # combined val loss for reference
+            combined_val = plot_dict["val_loss"]
+            plot_loss(
+                file=f"{plot_path}/loss_per_process.pdf",
+                losses=[combined_val] + proc_losses_list,
+                lr=None,
+                labels=["combined"] + proc_labels_list,
+                logy=logy,
+                title=loss_title,
+                x_scale=val_step,
+                legend_outside=True,
+            )
+
+        # ── optional: per-process val loss WITHOUT regularization ─────────────
+        proc_val_losses_no_reg = plot_dict.get("proc_val_losses_no_reg", {})
+        if proc_val_losses_no_reg:
+            proc_losses_nr_list = list(proc_val_losses_no_reg.values())
+            proc_labels_nr_list = [f"{short_ds_name(name)} (no reg)" for name in proc_val_losses_no_reg]
+            combined_val_no_reg = plot_dict.get("val_loss_no_reg", [])
+            base_losses = ([combined_val_no_reg] if combined_val_no_reg else []) + proc_losses_nr_list
+            base_labels = (["combined (no reg)"] if combined_val_no_reg else []) + proc_labels_nr_list
+            plot_loss(
+                file=f"{plot_path}/loss_per_process_no_reg.pdf",
+                losses=base_losses,
+                lr=None,
+                labels=base_labels,
+                logy=logy,
+                title=loss_title,
+                x_scale=val_step,
+                legend_outside=True,
+            )
+
+        # ── optional: per-process EMA loss the balanced sampler actually sees ──
+        # (with- and without-regularization EMAs, forced log scale).
+        proc_ema_losses = plot_dict.get("proc_ema_losses", {})
+        if proc_ema_losses:
+            ema_list   = list(proc_ema_losses.values())
+            ema_labels = [short_ds_name(name) for name in proc_ema_losses]
+
+            proc_ema_no_reg = plot_dict.get("proc_ema_losses_no_reg", {})
+            ema_nr_list   = list(proc_ema_no_reg.values()) if proc_ema_no_reg else None
+            ema_nr_labels = (
+                [f"{short_ds_name(name)} (no reg)" for name in proc_ema_no_reg]
+                if proc_ema_no_reg else None
+            )
+            plot_loss(
+                file=f"{plot_path}/loss_per_process_ema.pdf",
+                losses=ema_list,
+                lr=None,
+                labels=ema_labels,
+                logy=True,
+                title=loss_title,
+                x_scale=val_step,
+                losses_no_reg=ema_nr_list,
+                labels_no_reg=ema_nr_labels,
+                legend_outside=True,
+            )
+
+        # ── optional: per-process loss vs that dataset's own compute ──────────
+        # Stacked log-log (vs global iteration on top, vs per-dataset compute
+        # below) — the per-dataset compute is what the balanced sampler fits α on.
+        snapshots     = plot_dict.get("proc_compute_snapshots", [])
+        dataset_order = plot_dict.get("dataset_order", [])
+        if proc_val_losses and snapshots and dataset_order:
+            idx_of = {name: i for i, name in enumerate(dataset_order)}
+
+            def _compute_for(name):
+                return [s.get(idx_of[name], 0) for s in snapshots]
+
+            # solo scaling reference (dotted overlay): {dataset: [a, b]}
+            solo = plot_dict.get("solo_scaling", {}) or {}
+
+            names       = [n for n in proc_val_losses if n in idx_of]
+            losses_list = [proc_val_losses[n] for n in names]
+            computes    = [_compute_for(n) for n in names]
+            vc_labels   = [short_ds_name(n) for n in names]
+            solo_ref    = [solo.get(n) for n in names]
+
+            nr     = plot_dict.get("proc_val_losses_no_reg", {})
+            nr_names = [n for n in names if n in nr]
+            losses_nr   = [nr[n] for n in nr_names] if nr_names else None
+            computes_nr = [_compute_for(n) for n in nr_names] if nr_names else None
+            labels_nr   = (
+                [f"{short_ds_name(n)} (no reg)" for n in nr_names] if nr_names else None
+            )
+
+            plot_loss_vs_compute(
+                file=f"{plot_path}/loss_per_process_vs_compute.pdf",
+                losses=losses_list,
+                computes=computes,
+                labels=vc_labels,
+                title=loss_title,
+                losses_no_reg=losses_nr,
+                computes_no_reg=computes_nr,
+                labels_no_reg=labels_nr,
+                val_step=val_step,
+                solo_ref=solo_ref,
+            )
+
+            # EMA variant — the exact series the sampler fits α on.
+            if proc_ema_losses:
+                ema_names    = [n for n in proc_ema_losses if n in idx_of]
+                plot_loss_vs_compute(
+                    file=f"{plot_path}/loss_per_process_ema_vs_compute.pdf",
+                    losses=[proc_ema_losses[n] for n in ema_names],
+                    computes=[_compute_for(n) for n in ema_names],
+                    labels=[short_ds_name(n) for n in ema_names],
+                    title=loss_title,
+                    val_step=val_step,
+                    solo_ref=[solo.get(n) for n in ema_names],
+                )
+
+        # ── optional: MSE plot for HETEROSC ───────────────────────────────────
+        if (
+            cfg.training.loss == "HETEROSC"
+            and cfg.plotting.get("plot_mse_het", False)
+        ):
+            mse_losses = [
+                plot_dict.get("train_mse", []),
+                plot_dict.get("val_mse", []),
+            ]
+            plot_mse(
+                file=f"{plot_path}/mse.pdf",
+                mse_losses=mse_losses,
+                labels=["train MSE", "val MSE"],
+                title=loss_title,
+            )
+
+    if cfg.plotting.histograms and cfg.evaluate:
+        out = f"{plot_path}/histograms.pdf"
+        with PdfPages(out) as file:
+            labels = ["Test", "Train", "Prediction"]
+
+            # Signed-log so the histogram survives NON-POSITIVE amplitudes (NLO
+            # virtual corrections are not positive-definite); for positive LO |M|^2
+            # this is exactly log. Matches the signedlog amp_trafo training uses.
+            def _slog(a):
+                a = np.asarray(a, dtype=float)
+                return np.sign(a) * np.log(np.abs(a) + 1e-30)
+
+            dataset = "combined" if len(cfg.data.dataset) > 1 else cfg.data.dataset[0]
+            # sigma_only (the het sigma stage: mu frozen, so these pages are the main run's): only the sigma plots
+            if not sigma_only:
+                data = [
+                    _slog(plot_dict["results_test"][dataset]["raw"]["truth"]),
+                    _slog(plot_dict["results_train"][dataset]["raw"]["truth"]),
+                    _slog(plot_dict["results_test"][dataset]["raw"]["prediction"]),
+                ]
+                plot_histograms(
+                    file,
+                    data,
+                    labels,
+                    title=title[0],
+                    xlabel=r"$\log A$",
+                    logx=False,
+                    logy=True,
+                )
+
+                # Per-dataset pages (plotting.per_process_pages caps them: ~0.25 s a page,
+                # 478 pages were 2 of a short catalog run's 30 minutes; null = all)
+                _cap = cfg.plotting.get("per_process_pages", None)
+                _items = list(plot_dict.get("results_per_proc", {}).items())
+                if _cap is not None and len(_items) > int(_cap):
+                    # spread over the recipe order, so every family of a large catalog gets pages (its first entries
+                    # would be one initial state only)
+                    _keep = sorted({int(round(i)) for i in np.linspace(0, len(_items) - 1, int(_cap))})
+                    _items = [_items[i] for i in _keep]
+                for ds_name, ds_results in _items:
+                    if not all(k in ds_results for k in ("test", "train")):
+                        continue     # a process with under two events in a split has no page
+                    ds_data = [
+                        _slog(ds_results["test"]["raw"]["truth"]),
+                        _slog(ds_results["train"]["raw"]["truth"]),
+                        _slog(ds_results["test"]["raw"]["prediction"]),
+                    ]
+                    plot_histograms(
+                        file,
+                        ds_data,
+                        labels,
+                        title=f"{title[0].split(':')[0]}: {ds_name}",
+                        xlabel=r"$\log A$",
+                        logx=False,
+                        logy=True,
+                    )
+        
+            if cfg.training.loss == "HETEROSC":
+                labels = ["Test", "Train"]
+                sigmas_test = plot_dict["results_test"][dataset]["preprocessed"]["sigmas"]
+                pull_test = plot_dict["results_test"][dataset]["preprocessed"]["pull"]
+                sigmas_train = plot_dict["results_train"][dataset]["preprocessed"]["sigmas"]
+                pull_train = plot_dict["results_train"][dataset]["preprocessed"]["pull"]
+                sigmas = [sigmas_test, sigmas_train]
+                pulls = [pull_test, pull_train]
+                plot_histogram_single_output(
+                    file,
+                    sigmas,
+                    labels,
+                    title=f'{title[0]} - $\sigma$',
+                    xlabel=r"$\sigma$",
+                    logy=False,
+                    plot_ratios=False
+                )
+                plot_histogram_single_output(
+                    file,
+                    [sigmas_test],
+                    labels=["Test"],
+                    title=f'{title[0]} - $\sigma$',
+                    xlabel=r"$\sigma$",
+                    logy=False,
+                    plot_ratios=False
+                )
+                plot_histogram_single_output(
+                    file,
+                    [sigmas_test],
+                    labels=["Test"],
+                    title=f'{title[0]} - $\sigma$',
+                    xlabel=r"$\sigma$",
+                    logy=True,
+                    plot_ratios=False
+                )
+                plot_histogram_single_output(
+                    file,
+                    pulls,
+                    labels,
+                    xrange=(-5,5),
+                    title=f'{title[0]} - Pull',
+                    xlabel=r"$\mathrm{pull} = \frac{A_\mathrm{pred} - A_\mathrm{true}}{\sigma}$",
+                    logy=False,
+                    plot_ratios=False,
+                    pull=True
+                )
+                plot_histogram_single_output(
+                    file,
+                    [pull_test],
+                    xrange=(-5,5),
+                    labels=["Test"],
+                    title=f'{title[0]} - Pull',
+                    xlabel=r"$\mathrm{pull} = \frac{A_\mathrm{pred} - A_\mathrm{true}}{\sigma}$",
+                    logy=False,
+                    plot_ratios=False,
+                    pull=True
+                )
+                plot_histogram_single_output(
+                    file,
+                    [pull_test],
+                    xrange=(-5,5),
+                    labels=["Test"],
+                    title=f'{title[0]} - Pull',
+                    xlabel=r"$\mathrm{pull} = \frac{A_\mathrm{pred} - A_\mathrm{true}}{\sigma}$",
+                    logy=True,
+                    plot_ratios=False,
+                    pull=True
+                )
+                # Test vs 1% largest 
+                truth_test = plot_dict["results_test"][dataset]["raw"]["truth"]
+                plot_histogram_single_output(
+                    file,
+                    [pull_test, pull_test], # Will be masked internally
+                    xrange=(-5,5),  
+                    labels=["Test", "Largest 1\%"],
+                    title=f'{title[0]} - Pull',
+                    xlabel=r"$\mathrm{pull} = \frac{A_\mathrm{pred} - A_\mathrm{true}}{\sigma}$",
+                    logy=True,
+                    reference_truth=truth_test,  # Pass truth values for selection
+                    pull=True,
+                    plot_ratios=False
+                )
+                plot_histogram_single_output(
+                    file,
+                    [sigmas_test, sigmas_test],  # Will be masked internally
+                    labels=["Test", "Largest 1\%"],
+                    title=f'{title[0]} - $\sigma$',
+                    xlabel=r"$\sigma$",
+                    logy=True,
+                    plot_ratios=False,
+                    reference_truth=truth_test  # Pass truth values for selection
+                )
+
+    if cfg.plotting.delta and cfg.evaluate and not sigma_only:
+        out = f"{plot_path}/delta.pdf"
+        with PdfPages(out) as file:
+            dataset = "combined" if len(cfg.data.dataset) > 1 else cfg.data.dataset[0]
+            delta_test = (
+                plot_dict["results_test"][dataset]["raw"]["prediction"]
+                - plot_dict["results_test"][dataset]["raw"]["truth"]
+            ) / plot_dict["results_test"][dataset]["raw"]["truth"]
+            delta_train = (
+                plot_dict["results_train"][dataset]["raw"]["prediction"]
+                - plot_dict["results_train"][dataset]["raw"]["truth"]
+            ) / plot_dict["results_train"][dataset]["raw"]["truth"]
+
+            # determine 1% largest amplitudes
+            scale = plot_dict["results_test"][dataset]["raw"]["truth"]
+            largest_idx = round(0.01 * len(scale))
+            sort_idx = np.argsort(scale)
+            largest_min = scale[sort_idx][-largest_idx - 1]
+            largest_mask = scale > largest_min
+
+            xranges = [(-10.0, 10.0), (-30.0, 30.0), (-100.0, 100.0)]  # in %
+            binss = [100, 50, 50]
+            for xrange, bins in zip(xranges, binss):
+                plot_delta_histogram(
+                    file,
+                    [delta_test * 100, delta_train * 100],
+                    labels=["Test", "Train"],
+                    title=title[0],
+                    xlabel=r"$\Delta = \frac{A_\mathrm{pred} - A_\mathrm{true}}{A_\mathrm{true}}$ [\%]",
+                    xrange=xrange,
+                    bins=bins,
+                    logy=False,
+                )
+                plot_delta_histogram(
+                    file,
+                    [delta_test * 100, delta_test[largest_mask] * 100],
+                    labels=["Test", "Largest 1\%"],
+                    title=title[0],
+                    xlabel=r"$\Delta = \frac{A_\mathrm{pred} - A_\mathrm{true}}{A_\mathrm{true}}$ [\%]",
+                    xrange=xrange,
+                    bins=bins,
+                    logy=False,
+                )
+                plot_delta_histogram(
+                    file,
+                    [delta_test * 100, delta_test[largest_mask] * 100],
+                    labels=["Test", "Largest 1\%"],
+                    title=title[0],
+                    xlabel=r"$\Delta = \frac{A_\mathrm{pred} - A_\mathrm{true}}{A_\mathrm{true}}$ [\%]",
+                    xrange=xrange,
+                    bins=bins,
+                    logy=True,
+                )
+        out = f"{plot_path}/delta_abs.pdf"
+        with PdfPages(out) as file:
+            delta_test = np.abs(
+                (
+                    plot_dict["results_test"][dataset]["raw"]["prediction"]
+                    - plot_dict["results_test"][dataset]["raw"]["truth"]
+                )
+                / plot_dict["results_test"][dataset]["raw"]["truth"]
+            )
+            delta_train = np.abs(
+                (
+                    plot_dict["results_train"][dataset]["raw"]["prediction"]
+                    - plot_dict["results_train"][dataset]["raw"]["truth"]
+                )
+                / plot_dict["results_train"][dataset]["raw"]["truth"]
+            )
+
+            # determine 1% largest amplitudes
+            scale = plot_dict["results_test"][dataset]["raw"]["truth"]
+            largest_idx = round(0.01 * len(scale))
+            sort_idx = np.argsort(scale)
+            largest_min = scale[sort_idx][-largest_idx - 1]
+            largest_mask = scale > largest_min
+
+            xrange = (1e-8, 1)
+            bins = 60
+            plot_delta_histogram(
+                file,
+                [delta_test, delta_train],
+                labels=["Test", "Train"],
+                title=title[0],
+                xrange=xrange,
+                xlabel=r"$|\Delta| = |\frac{A_\mathrm{pred} - A_\mathrm{true}}{A_\mathrm{true}}|$ [\%]",
+                bins=bins,
+                logx=True,
+                logy=False,
+            )
+            plot_delta_histogram(
+                file,
+                [delta_test, delta_test[largest_mask]],
+                labels=["Test", "Largest 1\%"],
+                title=title[0],
+                xrange=xrange,
+                xlabel=r"$|\Delta| = |\frac{A_\mathrm{pred} - A_\mathrm{true}}{A_\mathrm{true}}|$ [\%]",
+                bins=bins,
+                logx=True,
+                logy=False,
+            )
+            
+
+    if cfg.plotting.delta_prepd and cfg.evaluate and not sigma_only:
+        out = f"{plot_path}/delta_prepd.pdf"
+        with PdfPages(out) as file:
+            dataset = "combined" if len(cfg.data.dataset) > 1 else cfg.data.dataset[0]
+            delta_test = (
+                plot_dict["results_test"][dataset]["preprocessed"]["prediction"]
+                - plot_dict["results_test"][dataset]["preprocessed"]["truth"]
+            ) / plot_dict["results_test"][dataset]["preprocessed"]["truth"]
+            delta_train = (
+                plot_dict["results_train"][dataset]["preprocessed"]["prediction"]
+                - plot_dict["results_train"][dataset]["preprocessed"]["truth"]
+            ) / plot_dict["results_train"][dataset]["preprocessed"]["truth"]
+
+            # determine 1% largest amplitudes
+            scale = plot_dict["results_test"][dataset]["preprocessed"]["truth"]
+            largest_idx = round(0.01 * len(scale))
+            sort_idx = np.argsort(scale)
+            largest_min = scale[sort_idx][-largest_idx - 1]
+            largest_mask = scale > largest_min
+
+            xranges = [(-10.0, 10.0), (-30.0, 30.0), (-100.0, 100.0)]  # in %
+            binss = [100, 50, 50]
+            for xrange, bins in zip(xranges, binss):
+                plot_delta_histogram(
+                    file,
+                    [delta_test * 100, delta_train * 100],
+                    labels=["Test", "Train"],
+                    title=title[0],
+                    xlabel=r"$\tilde\Delta = \frac{\tilde A_\mathrm{pred} - \tilde A_\mathrm{true}}{\tilde A_\mathrm{true}}$ [\%]",
+                    xrange=xrange,
+                    bins=bins,
+                    logy=False,
+                )
+                plot_delta_histogram(
+                    file,
+                    [delta_test * 100, delta_test[largest_mask] * 100],
+                    labels=["Test", "Largest 1\%"],
+                    title=title[0],
+                    xlabel=r"$\tilde\Delta = \frac{\tilde A_\mathrm{pred} - \tilde A_\mathrm{true}}{\tilde A_\mathrm{true}}$ [\%]",
+                    xrange=xrange,
+                    bins=bins,
+                    logy=False,
+                )
+                plot_delta_histogram(
+                    file,
+                    [delta_test * 100, delta_test[largest_mask] * 100],
+                    labels=["Test", "Largest 1\%"],
+                    title=title[0],
+                    xlabel=r"$\tilde\Delta = \frac{\tilde A_\mathrm{pred} - \tilde A_\mathrm{true}}{\tilde A_\mathrm{true}}$ [\%]",
+                    xrange=xrange,
+                    bins=bins,
+                    logy=True,
+                )
+
+
+def plot_histograms(
+    file,
+    data,
+    labels,
+    bins=60,
+    xlabel=None,
+    title=None,
+    logx=False,
+    logy=False,
+    xrange=None,
+    ratio_range=[0.85, 1.15],
+    ratio_ticks=[0.9, 1.0, 1.1],
+):
+    hists = []
+    for dat in data:
+        hist, bins = np.histogram(dat, bins=bins, range=xrange)
+        hists.append(hist)
+    integrals = [np.sum((bins[1:] - bins[:-1]) * hist) for hist in hists]
+    scales = [1 / integral if integral != 0.0 else 1.0 for integral in integrals]
+    dup_last = lambda a: np.append(a, a[-1])
+
+    fig, axs = plt.subplots(
+        2,
+        1,
+        sharex=True,
+        figsize=(6, 4),
+        gridspec_kw={"height_ratios": [3, 1], "hspace": 0.0},
+    )
+    for i, hist, scale, label, color in zip(
+        range(len(hists)), hists, scales, labels, colors
+    ):
+        axs[0].step(
+            bins,
+            dup_last(hist) * scale,
+            label=label,
+            color=color,
+            linewidth=1.0,
+            where="post",
+        )
+        if i == 0:
+            axs[0].fill_between(
+                bins,
+                dup_last(hist) * scale,
+                0.0 * dup_last(hist),
+                facecolor=color,
+                alpha=0.1,
+                step="post",
+            )
+            continue
+
+        ratio = np.divide(
+            hist * scale, hists[0] * scales[0], where=hists[0] * scales[0] != 0
+        )  # sets denominator=0 terms to 0
+        axs[1].step(bins, dup_last(ratio), linewidth=1.0, where="post", color=color)
+
+    if logx:
+        axs[0].set_xscale("log")
+    if logy:
+        axs[0].set_yscale("log")
+
+    axs[0].legend(loc="upper right", frameon=False, fontsize=FONTSIZE_LEGEND)
+    axs[0].set_ylabel("Normalized", fontsize=FONTSIZE)
+    axs[1].set_xlabel(xlabel, fontsize=FONTSIZE)
+
+    _, ymax = axs[0].get_ylim()
+    axs[0].set_ylim(0.0, ymax)
+    axs[0].tick_params(axis="both", labelsize=FONTSIZE_TICK)
+    axs[1].tick_params(axis="both", labelsize=FONTSIZE_TICK)
+    axs[0].text(
+        0.04,
+        0.95,
+        s=title,
+        horizontalalignment="left",
+        verticalalignment="top",
+        transform=axs[0].transAxes,
+        fontsize=FONTSIZE,
+    )
+
+    axs[1].set_yticks(ratio_ticks)
+    axs[1].set_ylim(ratio_range)
+    axs[1].axhline(y=ratio_ticks[0], c="black", ls="dotted", lw=0.5)
+    axs[1].axhline(y=ratio_ticks[1], c="black", ls="--", lw=0.7)
+    axs[1].axhline(y=ratio_ticks[2], c="black", ls="dotted", lw=0.5)
+
+    fig.savefig(file, format="pdf", bbox_inches="tight")
+    plt.close()
+
+
+def plot_delta_histogram(
+    file,
+    datas,
+    labels,
+    title,
+    xrange,
+    bins=60,
+    xlabel=None,
+    logy=False,
+    logx=False,
+):
+    assert len(datas) == 2
+    dup_last = lambda a: np.append(a, a[-1])
+    if logx:
+        bins = np.logspace(np.log(xrange[0]), np.log(xrange[1]), bins)
+    else:
+        _, bins = np.histogram(datas[0], bins=bins - 1, range=xrange)
+    hists, scales, mses = [], [], []
+    for data in datas:
+        mse = np.mean(data**2)
+
+        data = np.clip(data, xrange[0], xrange[1])
+        hist, _ = np.histogram(data, bins=bins, range=xrange)
+        scale = 1 / np.sum((bins[1:] - bins[:-1]) * hist)
+        mses.append(mse)
+        hists.append(hist)
+        scales.append(scale)
+
+    fig, axs = plt.subplots(figsize=(6, 4))
+    for hist, scale, mse, label, color in zip(
+        hists, scales, mses, labels, colors[1:3][::-1]
+    ):
+        axs.step(
+            bins,
+            dup_last(hist) * scale,
+            color,
+            where="post",
+            label=label + r" ($\overline{\Delta^2} = {%.2g})$" % (mse * 1e-4),
+        )  # need 1e-4 to compensate for initial *100
+        axs.fill_between(
+            bins,
+            dup_last(hist) * scale,
+            0.0 * dup_last(hist) * scale,
+            facecolor=color,
+            alpha=0.1,
+            step="post",
+        )
+
+    if logy:
+        axs.set_yscale("log")
+    if logx:
+        axs.set_xscale("log")
+    ymin, ymax = axs.get_ylim()
+    if not logy:
+        ymin = 0.0
+    axs.vlines(0.0, ymin, ymax, color="k", linestyle="--", lw=0.5)
+    axs.set_ylim(ymin, ymax)
+    axs.set_xlim(xrange)
+
+    axs.set_xlabel(xlabel, fontsize=FONTSIZE)
+    axs.tick_params(axis="both", labelsize=FONTSIZE_TICK)
+    axs.legend(frameon=False, loc="upper left", fontsize=FONTSIZE * 0.7)
+    axs.text(
+        0.95,
+        0.95,
+        s=title,
+        horizontalalignment="right",
+        verticalalignment="top",
+        transform=axs.transAxes,
+        fontsize=FONTSIZE,
+    )
+
+    fig.savefig(file, format="pdf", bbox_inches="tight")
+    plt.close()
+
+def plot_gradients(file, model, iteration):
+    layer_names = []
+    grad_values = []
+
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            layer_names.append(name)
+            grad_values.append(param.grad.detach().cpu().view(-1).numpy())
+
+    # Plotting
+    n_layers = len(layer_names)
+    if n_layers == 0:
+        # print("No gradients to plot.")
+        return
+        
+    fig, axs = plt.subplots(n_layers, 1, figsize=(6, 2 * n_layers))
+
+    if n_layers == 1:
+        axs = [axs]
+
+    for ax, name, grads in zip(axs, layer_names, grad_values):
+        ax.hist(grads, range=(grads.min(),grads.max()), bins=50, alpha=0.7)
+        ax.set_title(f'Gradient Histogram: {name}')
+        ax.set_xlabel("Gradient value")
+        ax.set_ylabel("Frequency")
+        ax.set_xlim(grads.min(), grads.max())
+        # print(name, grads.min(), grads.max(), grads.mean(), grads.std())
+    plt.suptitle(f"Gradients at iteration {iteration}", fontsize=FONTSIZE)
+    plt.tight_layout()
+    plt.savefig(f'{file}/gradients_{iteration}.pdf', format="pdf", bbox_inches="tight")
+    plt.show()
+
+def plot_weights(file, model, iteration):
+    layer_names = []
+    weight_values = []
+
+    for name, param in model.named_parameters():
+        if param.requires_grad and param.data is not None:
+            layer_names.append(name)
+            weight_values.append(param.data.detach().cpu().view(-1).numpy())
+
+    n_layers = len(layer_names)
+    if n_layers == 0:
+        # print("No weights to plot.")
+        return
+
+    fig, axs = plt.subplots(n_layers, 1, figsize=(6, 2 * n_layers))
+
+    if n_layers == 1:
+        axs = [axs]
+
+    for ax, name, weights in zip(axs, layer_names, weight_values):
+        ax.hist(weights, range=(weights.min(), weights.max()), bins=50, alpha=0.7)
+        ax.set_title(f'Weight Histogram: {name}')
+        ax.set_xlabel("Weight value")
+        ax.set_ylabel("Frequency")
+        ax.set_xlim(weights.min(), weights.max())
+        # print(name, weights.min(), weights.max(), weights.mean(), weights.std())
+
+    plt.suptitle(f"Weights at iteration {iteration}", fontsize=FONTSIZE)
+    plt.tight_layout()
+    plt.savefig(f'{file}/weights_{iteration}.pdf', format="pdf", bbox_inches="tight")
+    plt.show()
+
+def plot_histogram_single_output(
+    file,
+    data,  # List of arrays with shape (N,) or list of batches with shape (M,)
+    labels,
+    n_bins=60,
+    xlabel=None,
+    title=None,
+    logx=False,
+    logy=False,
+    xrange=None,
+    ratio_range=[0.85, 1.15],
+    ratio_ticks=[0.9, 1.0, 1.1],
+    plot_ratios=True,
+    pull=False,
+    reference_truth=None,
+):
+    
+    restructured_data = [np.concatenate([np.array(batch) for batch in dataset]) for dataset in data]
+    flat_reference = np.concatenate([np.array(batch) for batch in reference_truth]) if reference_truth is not None else None
+    
+    if reference_truth is not None and len(restructured_data) == 2:
+        truth_values = flat_reference
+        largest_idx = max(1,round(0.01 * len(truth_values)))
+        sort_idx = np.argsort(truth_values)
+        largest_min = truth_values[sort_idx][-largest_idx - 1]
+        largest_mask = truth_values > largest_min
+        if not largest_mask.any():   # a constant truth (V/B of a massless 2->2) has no value above its 1% quantile
+            largest_mask = np.zeros_like(largest_mask); largest_mask[sort_idx[-largest_idx:]] = True
+        restructured_data[1] = restructured_data[1][largest_mask]
+    
+    if xrange is None:
+        min_val = min(np.min(dat) for dat in restructured_data)
+        max_val = max(np.max(dat) for dat in restructured_data)
+        bins = np.linspace(min_val, max_val, n_bins + 1)
+    else:
+        bins = np.linspace(xrange[0], xrange[1], n_bins + 1)
+
+    hists = []
+    for dat in restructured_data:
+        hist, _ = np.histogram(dat, bins=bins)
+        hists.append(hist)
+
+    integrals = [np.sum((bins[1:] - bins[:-1]) * hist) for hist in hists]
+    scales = [1 / integral if integral != 0.0 else 1.0 for integral in integrals]
+    dup_last = lambda a: np.append(a, a[-1])
+
+    # Plotting
+    fig = plt.figure(figsize=(6, 6 if not plot_ratios else 8))
+    if plot_ratios:
+        gs = fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0)
+        ax_main = fig.add_subplot(gs[0])
+        ax_ratio = fig.add_subplot(gs[1], sharex=ax_main)
+        ax_ratio.set_ylabel("Ratio", fontsize=FONTSIZE)
+    else:
+        ax_main = fig.add_subplot(111)
+        ax_ratio = None
+
+    for i, hist, scale, label, color in zip(
+        range(len(hists)), hists, scales, labels, colors
+    ):
+        ax_main.step(
+            bins,
+            dup_last(hist) * scale,
+            label=label,
+            color=color,
+            linewidth=1.0,
+            where="post",
+        )
+        if i == 0:
+            ax_main.fill_between(
+                bins,
+                dup_last(hist) * scale,
+                0.0,
+                facecolor=color,
+                alpha=0.1,
+                step="post",
+            )
+        elif plot_ratios:
+            ratio = np.divide(
+                hist * scale, hists[0] * scales[0], where=hists[0] * scales[0] != 0
+            )
+            ax_ratio.step(
+                bins, dup_last(ratio), linewidth=1.0, where="post", color=color
+            )
+
+    if logx:
+        ax_main.set_xscale("log")
+    if logy:
+        ax_main.set_yscale("log")
+    if pull:
+        x = np.linspace(xrange[0], xrange[1], 1000) if xrange else np.linspace(min_val, max_val, 1000)
+        gaussian = norm.pdf(x, 0, 1)
+        ax_main.plot(x, gaussian, 'r--', linewidth=2, label='Gaussian (0, 1)')
+
+    ax_main.set_ylabel("Normalized", fontsize=FONTSIZE)
+    ax_main.set_title(title, fontsize=FONTSIZE + 2)
+    ax_main.tick_params(axis="both", labelsize=FONTSIZE_TICK)
+    ax_main.legend(loc="best", frameon=False, fontsize=FONTSIZE_LEGEND)
+
+    if xlabel:
+        (ax_ratio if plot_ratios else ax_main).set_xlabel(xlabel, fontsize=FONTSIZE)
+
+    if plot_ratios:
+        ax_ratio.set_yticks(ratio_ticks)
+        ax_ratio.set_ylim(ratio_range)
+        for tick in ratio_ticks:
+            ax_ratio.axhline(y=tick, c="black", ls="--" if tick == 1.0 else "dotted", lw=0.7)
+        ax_ratio.tick_params(axis="both", labelsize=FONTSIZE_TICK)
+
+    fig.tight_layout()
+    fig.savefig(file, format="pdf", bbox_inches="tight")
+    plt.close()

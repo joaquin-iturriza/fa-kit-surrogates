@@ -1,0 +1,653 @@
+import os
+from functools import partial
+
+import torch
+from torch import nn
+from torch.utils.checkpoint import checkpoint
+import mup  # Microsoft μP library
+from mup import MuReadout, set_base_shapes, make_base_shapes
+
+from lloca.framesnet.frames import Frames
+
+from .attention_lloca_mup import LLoCaAttention, build_block_diagonal_bias, build_pair_ctx
+from .bayesian_readout import MuBayesianReadout
+from lloca.reps.tensorreps import TensorReps
+from lloca.mup import mup_parametrized  # self-contained μP base-shape machinery
+
+def init_method_normal(sigma):
+    """Init method based on N(0, sigma)."""
+    def init_(tensor):
+        return nn.init.normal_(tensor, mean=0.0, std=sigma)
+    return init_
+
+
+class BaselineLayerNorm(nn.Module):
+    """Baseline layer norm over all dimensions except the first."""
+
+    @staticmethod
+    def forward(inputs: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Parameters
+        ----------
+        inputs : Tensor
+            Input data
+
+        Returns
+        -------
+        outputs : Tensor
+            Normalized inputs.
+        """
+        return torch.nn.functional.layer_norm(
+            inputs, normalized_shape=inputs.shape[-1:]
+        )
+
+
+class MultiHeadQKVLinear(nn.Module):
+    """Compute queries, keys, and values via multi-head attention.
+
+    Parameters
+    ----------
+    in_channels : int
+        Number of input channels.
+    hidden_channels : int
+        Number of hidden channels = size of query, key, and value.
+    num_heads : int
+        Number of attention heads.
+    """
+
+    def __init__(self, in_channels, hidden_channels, num_heads, encoder_var=1.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.hidden_channels = hidden_channels
+        self.linear = nn.Linear(in_channels, 3 * hidden_channels * num_heads)
+
+        # fan-in of the K/V projections is in_channels (the full hidden dim, scales with width),
+        # not hidden_channels (the per-head dim, constant). Using in_channels keeps K/V output
+        # variance O(1) across widths.
+        self.init_method = init_method_normal((encoder_var / in_channels)**0.5)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        #zero initialize querry head weights???
+        self.init_method(self.linear.weight)
+        q_weights = self.linear.weight[:self.hidden_channels * self.num_heads]
+        nn.init.zeros_(q_weights)
+        if self.linear.bias is not None:
+            nn.init.zeros_(self.linear.bias)
+
+    def forward(self, inputs):
+        """Forward pass.
+
+        Returns
+        -------
+        q : Tensor
+            Queries
+        k : Tensor
+            Keys
+        v : Tensor
+            Values
+        """
+        qkv = self.linear(inputs)  # (..., num_items, 3 * hidden_channels * num_heads)
+
+        *leading, items, last = qkv.shape
+        hidden_channels = last // (3 * self.num_heads)
+        qkv = qkv.view(*leading, items, 3, hidden_channels, self.num_heads)
+        qkv = qkv.movedim(-3, 0).movedim(-1, len(leading) + 1)
+        q, k, v = qkv.unbind(dim=0)  # 3x (..., num_heads, num_items, hidden_channels)
+        return q, k, v
+
+
+class MultiQueryQKVLinear(nn.Module):
+    """Compute queries, keys, and values via multi-query attention.
+
+    Parameters
+    ----------
+    in_channels : int
+        Number of input channels.
+    hidden_channels : int
+        Number of hidden channels = size of query, key, and value.
+    num_heads : int
+        Number of attention heads.
+    """
+
+    def __init__(self, in_channels, hidden_channels, num_heads, encoder_var=1.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.q_linear = nn.Linear(in_channels, hidden_channels * num_heads)
+        self.k_linear = nn.Linear(in_channels, hidden_channels)
+        self.v_linear = nn.Linear(in_channels, hidden_channels)
+
+        # Same reasoning as MultiHeadQKVLinear: fan-in is in_channels, not hidden_channels.
+        self.init_method = init_method_normal((encoder_var / in_channels)**0.5)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        #zero initialize querry head weights???
+        self.init_method(self.k_linear.weight)
+        self.init_method(self.v_linear.weight)
+        nn.init.zeros_(self.q_linear.weight)
+        if self.q_linear.bias is not None:
+            nn.init.zeros_(self.q_linear.bias)
+        if self.k_linear.bias is not None:
+            nn.init.zeros_(self.k_linear.bias)
+        if self.v_linear.bias is not None:
+            nn.init.zeros_(self.v_linear.bias)
+
+    def forward(self, inputs):
+        """Forward pass.
+
+        Parameters
+        ----------
+        inputs : Tensor
+            Input data
+
+        Returns
+        -------
+        q : Tensor
+            Queries
+        k : Tensor
+            Keys
+        v : Tensor
+            Values
+        """
+        q = self.q_linear(inputs)
+
+        *leading, items, last = q.shape
+        hidden_channels = last // self.num_heads
+        q = q.reshape(*leading, items, self.num_heads, hidden_channels)
+        q = q.movedim(-2, -3)
+
+        k = self.k_linear(inputs)[
+            ..., None, :, :
+        ]  # (..., head=1, item, hidden_channels)
+        v = self.v_linear(inputs)[..., None, :, :]
+        return q, k, v
+
+
+class BaselineSelfAttention(nn.Module):
+    """Baseline self-attention layer.
+
+    Parameters
+    ----------
+    in_channels : int
+        Number of input channels.
+    out_channels : int
+        Number of input channels.
+    hidden_channels : int
+        Number of hidden channels = size of query, key, and value.
+    attention
+    num_heads : int
+        Number of attention heads.
+    multi_query : bool
+        Use multi-query attention instead of multi-head attention.
+    dropout_prob : float
+        Dropout probability for output.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        hidden_channels: int,
+        attention,
+        num_heads: int = 8,
+        multi_query: bool = True,
+        dropout_prob=None,
+        encoder_var=1.0,
+    ) -> None:
+        super().__init__()
+
+        # Store settings
+        self.num_heads = num_heads
+        self.hidden_channels = hidden_channels
+
+        self.attention = attention
+
+        # Linear maps
+        qkv_class = MultiQueryQKVLinear if multi_query else MultiHeadQKVLinear
+        self.qkv_linear = qkv_class(in_channels, hidden_channels, num_heads)
+        self.out_linear = nn.Linear(hidden_channels * num_heads, out_channels)
+
+        if dropout_prob is not None:
+            self.dropout = nn.Dropout(dropout_prob)
+        else:
+            self.dropout = None
+
+        # out_linear fan-in is hidden_channels * num_heads (total concatenated heads),
+        # not hidden_channels (per-head). Use the total to keep output variance O(1).
+        self.init_method = init_method_normal((encoder_var / (hidden_channels * num_heads))**0.5)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        self.init_method(self.out_linear.weight)
+        if self.out_linear.bias is not None:
+            nn.init.zeros_(self.out_linear.bias)
+
+    def forward(self, inputs: torch.Tensor, **attn_kwargs) -> torch.Tensor:
+        """Forward pass.
+
+        Parameters
+        ----------
+        inputs : Tensor
+            Input data
+        **attn_kwargs
+
+        Returns
+        -------
+        outputs : Tensor
+            Outputs
+        """
+        q, k, v = self.qkv_linear(
+            inputs
+        )  # each: (..., num_heads, num_items, num_channels)
+
+        # Attention layer
+        h = self.attention(
+            q.contiguous(),
+            k.expand_as(q).contiguous(),
+            v.expand_as(q),
+            **attn_kwargs,
+        )
+
+        # Concatenate heads and transform linearly
+        *leading, num_heads, num_items, hidden_channels = h.shape
+        h = h.permute(*range(len(leading)), -2, -3, -1)
+        h = h.reshape(*leading, num_items, num_heads * hidden_channels)
+
+        outputs = self.out_linear(h)  # (..., num_items, out_channels)
+
+        if self.dropout is not None:
+            outputs = self.dropout(outputs)
+
+        return outputs
+
+
+class BaselineTransformerBlock(nn.Module):
+    """Baseline transformer block.
+
+    Inputs are first processed by a block consisting of LayerNorm, multi-head self-attention, and
+    residual connection. Then the data is processed by a block consisting of another LayerNorm, an
+    item-wise two-layer MLP with GeLU activations, and another residual connection.
+
+    Parameters
+    ----------
+    channels : int
+        Number of input and output channels.
+    attention
+    num_heads : int
+        Number of attention heads.
+    attention_factor : int
+        Factor by which the key, query, and value size is increased over the default value of
+        hidden_channels / num_heads.
+    mlp_factor : int
+        Factor by which the activation size is increased over the default value of hidden_channels.
+    multi_query : bool
+        Use multi-query attention instead of multi-head attention.
+    dropout_prob : float
+        Dropout probability for output.
+    """
+
+    def __init__(
+        self,
+        channels,
+        attention,
+        num_heads: int = 8,
+        attention_factor: int = 1,
+        multi_query: bool = True,
+        mlp_factor: int = 4,
+        dropout_prob=None,
+        encoder_var=1.0,
+    ) -> None:
+        super().__init__()
+
+        self.norm1 = BaselineLayerNorm()
+        self.norm2 = BaselineLayerNorm()
+        self.gate1 = self.gate2 = None
+
+        hidden_channels = channels // num_heads * attention_factor
+
+        self.attention = BaselineSelfAttention(
+            channels,
+            channels,
+            hidden_channels,
+            attention,
+            num_heads=num_heads,
+            multi_query=multi_query,
+            dropout_prob=dropout_prob,
+        )
+
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, mlp_factor * channels),
+            nn.Dropout(dropout_prob) if dropout_prob is not None else nn.Identity(),
+            nn.GELU(),
+            nn.Linear(mlp_factor * channels, channels),
+            nn.Dropout(dropout_prob) if dropout_prob is not None else nn.Identity(),
+        )
+
+        self.init_method = init_method_normal((encoder_var / channels)**0.5)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        for layer in self.mlp:
+            if isinstance(layer, nn.Linear):
+                self.init_method(layer.weight)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
+
+    def forward(self, inputs: torch.Tensor, **attn_kwargs) -> torch.Tensor:
+        """Forward pass.
+
+        Parameters
+        ----------
+        inputs : Tensor
+            Input data
+        **attn_kwargs
+
+        Returns
+        -------
+        outputs : Tensor
+            Outputs
+        """
+
+        # Residual attention (gate1/gate2: model.net.layer_norm=rezero's learned branch scalars, else None)
+        h = self.norm1(inputs)
+        h = self.attention(h, **attn_kwargs)
+        outputs = inputs + (h if self.gate1 is None else self.gate1 * h)
+
+        # Residual MLP
+        h = self.norm2(outputs)
+        h = self.mlp(h)
+        outputs = outputs + (h if self.gate2 is None else self.gate2 * h)
+
+        return outputs
+
+
+@mup_parametrized
+class MuPTransformer(nn.Module):
+    """Baseline transformer.
+
+    Combines num_blocks transformer blocks, each consisting of multi-head self-attention layers, an
+    MLP, residual connections, and normalization layers.
+
+    μP is self-contained: with ``parametrization="mup"`` (the default) the backbone
+    computes its own base shapes during ``__init__`` (width axis = ``num_heads``), so
+    no external ``make_base_shapes`` / ``set_base_shapes`` is needed. Any parameters
+    living outside this backbone (framesnet, particle encoder, ...) are marked as
+    standard parametrization by ``lloca.mup.finalize(model)`` in the training loop.
+
+    Parameters
+    ----------
+    in_channels : int
+        Number of input channels.
+    attn_reps : str
+        Representation of each attention head.
+    out_channels : int
+        Number of output channels.
+    num_blocks : int
+        Number of transformer blocks.
+    num_heads : int
+        Number of attention heads.
+    checkpoint_blocks : bool
+        Use gradient checkpointing for transformer blocks.
+    attention_factor : int
+        Factor by which the key, query, and value size is increased over the default value of
+        hidden_channels / num_heads.
+    mlp_factor : int
+        Factor by which the activation size is increased over the default value of hidden_channels.
+    multi_query : bool
+        Use multi-query attention instead of multi-head attention.
+    dropout_prob : float
+        Dropout probability for output.
+    parametrization : str
+        ``"mup"`` (default) or ``"sp"``. Note this backbone uses ``MuReadout`` and
+        only works under μP; ``"sp"`` exists only so base/delta clones can be built.
+    mup_base_shapes, mup_delta_shapes : dict, optional
+        Base/delta width overrides; default ``{"num_heads": 2}`` / ``{"num_heads": 8}``
+        (matching the previous base_experiment base/delta configuration).
+    """
+
+    # Base/delta widths previously defined in base_experiment.init_model.
+    DEFAULT_MUP_SHAPES = ({"num_heads": 2}, {"num_heads": 8})
+
+    def __init__(
+        self,
+        in_channels: int,
+        attn_reps: str,
+        out_channels: int,
+        num_blocks: int,
+        num_heads: int,
+        checkpoint_blocks: bool = False,
+        attention_factor: int = 1,
+        mlp_factor: int = 4,
+        multi_query: bool = False,
+        dropout_prob=None,
+        encoder_var=1.0,
+        *,
+        parametrization: str = "mup",
+        mup_base_shapes: dict | None = None,
+        mup_delta_shapes: dict | None = None,
+        bayesian_readout: bool = False,
+        bnn_prior_prec: float = 1.0,
+        bnn_logsig2_init: float = -9.0,
+        sign_branch: bool = False,
+        sign_index: int | None = None,
+        sign_branch_blocks: int = 1,
+    ) -> None:
+        super().__init__()
+        self.parametrization = parametrization
+        attn_reps = TensorReps(attn_reps)
+        self.hidden_channels = attn_reps.dim * num_heads // attention_factor
+        self.checkpoint_blocks = checkpoint_blocks
+        self.attention = LLoCaAttention(attn_reps, num_heads)
+
+        self.linear_in = nn.Linear(in_channels, self.hidden_channels)
+        self.blocks = nn.ModuleList(
+            [
+                BaselineTransformerBlock(
+                    self.hidden_channels,
+                    attention=self.attention,
+                    num_heads=num_heads,
+                    attention_factor=attention_factor,
+                    mlp_factor=mlp_factor,
+                    multi_query=multi_query,
+                    dropout_prob=dropout_prob,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+        # bayesian_readout: the variational "BNN last layer" (models/bayesian_readout.py); a MuReadout subclass, so
+        # the μP base shapes, rescaling and 1/width output scaling are those of the plain readout.
+        if bayesian_readout:
+            self.linear_out = MuBayesianReadout(self.hidden_channels, out_channels, bias=True,
+                                                prior_prec=bnn_prior_prec, logsig2_init=bnn_logsig2_init)
+        else:
+            self.linear_out = MuReadout(self.hidden_channels, out_channels, bias=True)
+        # sign_branch (models/lloca.py, HETEROSC + sign head): the readout's row sign_index (the sign logit) is read
+        # from sign_block, a copy of the last block (the last sign_branch_blocks blocks) fed the last block's input DETACHED and the frames DETACHED, so the
+        # sign loss's gradient reaches only sign_block and that readout row, never the trunk or the framesnet. Built
+        # under fork_rng and set to the last block's initial weights, so nothing else's initialisation moves.
+        self.sign_branch = bool(sign_branch)
+        self.sign_index = sign_index
+        if self.sign_branch:
+            assert sign_index is not None and 0 <= sign_index < out_channels, (sign_index, out_channels)
+            assert num_blocks >= 1
+            # sign_branch_blocks k (plan catalog_coverage step 80): the branch is a copy of the LAST k blocks, fed the
+            # input of block num_blocks - k detached; k = 1 is step 73's branch, its module and parameter names unchanged
+            k_sb = int(sign_branch_blocks)
+            assert 1 <= k_sb <= num_blocks, (sign_branch_blocks, num_blocks)
+            self.sign_branch_blocks = k_sb
+
+            def _copy():
+                return BaselineTransformerBlock(
+                    self.hidden_channels,
+                    attention=self.attention,
+                    num_heads=num_heads,
+                    attention_factor=attention_factor,
+                    mlp_factor=mlp_factor,
+                    multi_query=multi_query,
+                    dropout_prob=dropout_prob,
+                )
+            with torch.random.fork_rng(devices=[]):
+                self.sign_block = _copy() if k_sb == 1 else _BlockStack([_copy() for _ in range(k_sb)])
+            if k_sb == 1:
+                self.sign_block.load_state_dict(self.blocks[-1].state_dict())
+            else:
+                for i, b in enumerate(self.sign_block.blocks):
+                    b.load_state_dict(self.blocks[num_blocks - k_sb + i].state_dict())
+        self.init_method = init_method_normal((encoder_var / in_channels)**0.5)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        self.init_method(self.linear_in.weight)
+        if self.linear_in.bias is not None:
+            nn.init.zeros_(self.linear_in.bias)
+
+    # the attributes LLoCaAttention.prepare_frames sets (both the broadcast and the repeat path)
+    _FRAME_STATE = ("frames", "frames_qkv", "_frames_broadcast", "_bcast_qkv_mats", "_bcast_qkv_det",
+                    "_bcast_out_mats", "_bcast_out_det")
+
+    def _frame_state(self):
+        d = self.attention.__dict__
+        return {a: d[a] for a in self._FRAME_STATE if a in d}
+
+    def _set_frame_state(self, state):
+        for a, v in state.items():
+            setattr(self.attention, a, v)
+
+    def _sign_block_detached(self, x, detached_state, **attn_kwargs):
+        """sign_block on the shared attention with the DETACHED prepared frames, the live ones restored after (also
+        when a checkpointed trunk block recomputes in backward, it reads the live frames)."""
+        live = self._frame_state()
+        self._set_frame_state(detached_state)
+        try:
+            return self.sign_block(x, **attn_kwargs)
+        finally:
+            self._set_frame_state(live)
+
+    def forward(self, inputs: torch.Tensor, frames, **attn_kwargs) -> torch.Tensor:
+        """Forward pass.
+
+        Parameters
+        ----------
+        inputs : Tensor
+            Input data with shape (..., num_items, in_channels)
+        frames : Frames
+            Local frames used for invariant particle attention
+        **attn_kwargs
+
+        Returns
+        -------
+        outputs : Tensor
+            Outputs with shape (..., num_items, out_channels)
+        """
+        self.attention.prepare_frames(frames)
+
+        # Build the block-diagonal attention mask ONCE per forward instead of once
+        # per block. Deriving it from `ptr` requires a GPU→CPU sync (.tolist()); the
+        # mask is identical for every block, so doing it here turns num_blocks syncs
+        # per step into one. Set LLOCA_ATTN_MASK=per_block to fall back to the old
+        # per-block derivation (kept for A/B timing / equivalence checks).
+        ptr = attn_kwargs.pop("ptr", None)
+        # CPU-side per-event lengths (optional): lets build_block_diagonal_bias skip
+        # the GPU→CPU sync. Computed from the CPU ptr in _batch_loss_lloca; None on
+        # the eval path or under LLOCA_SYNC=blocking, where we fall back to ptr.
+        seq_lens = attn_kwargs.pop("seq_lens", None)
+        # Return the pre-readout backbone features h instead of linear_out(h). Used by
+        # the HETEROSC detach_sigma_backbone path (models/lloca.py) so the caller can
+        # apply linear_out twice — once on h (mean, grad to backbone) and once on
+        # h.detach() (sigma, no grad to backbone).
+        return_features = attn_kwargs.pop("return_features", False)
+        # Per-pair attention bias (diagram-derived off-shellness; built by the
+        # wrapper). When present it carries its own padded event-isolation mask, so
+        # the xformers block-diagonal mask is skipped entirely.
+        pair_ctx = attn_kwargs.pop("pair_ctx", None)
+        # Per-token additive term on the token embeddings (after linear_in, before the
+        # first block): the arXiv:2606.23791 diagram vector, placed on every particle of
+        # the event by the wrapper (models/diagram_encoder_llm4lhc.process_token_add).
+        token_add = attn_kwargs.pop("token_add", None)
+        # Autoregressive mask within each event (LLOCAMuPTransformer.causal_mask): block-diagonal across events,
+        # lower-triangular inside each (xformers BlockDiagonalCausalMask). Always built once per forward.
+        causal = bool(attn_kwargs.pop("causal", False))
+        if causal:
+            assert pair_ctx is None and ptr is not None, "causal_mask needs ptr and no pairwise attention bias"
+            attn_kwargs["attn_bias"] = build_block_diagonal_bias(ptr, seq_lens=seq_lens, causal=True)
+        elif pair_ctx is not None:
+            attn_kwargs["pair_ctx"] = pair_ctx
+        elif ptr is not None and inputs.dtype == torch.float64:
+            # float64 (training.dtype=float64): xformers has no float64 kernel, so the per-event attention runs in the
+            # padded dense layout of the pair-bias path, with no bias (exact, cheap for events of a few particles)
+            attn_kwargs["pair_ctx"] = build_pair_ctx(ptr, inputs.shape[-2], seq_lens=seq_lens)
+        elif ptr is not None:
+            if os.environ.get("LLOCA_ATTN_MASK", "per_forward") == "per_block":
+                attn_kwargs["ptr"] = ptr
+            else:
+                attn_kwargs["attn_bias"] = build_block_diagonal_bias(ptr, seq_lens=seq_lens)
+
+        h = self.linear_in(inputs)
+        if token_add is not None:
+            h = h + token_add.to(h.dtype)
+        if self.sign_branch:
+            assert not return_features, "sign_branch: the return_features paths are not wired"
+            # the same frames with no graph to the framesnet, prepared once; the live prepared state is put back
+            live = self._frame_state()
+            self.attention.prepare_frames(_detach_frames(frames))
+            detached_state = self._frame_state()
+            self._set_frame_state(live)
+        h_prev = None
+        i_branch = len(self.blocks) - getattr(self, "sign_branch_blocks", 1)   # the branch's input: block i_branch's
+        for i, block in enumerate(self.blocks):
+            if i == i_branch:
+                h_prev = h
+            if self.checkpoint_blocks:
+                fn = partial(block, **attn_kwargs)
+                # use_reentrant=False is required here: the block's attention reads
+                # the per-event frames stored on the shared LLoCaAttention module
+                # (computed once outside the checkpoint, and grad-connected to the
+                # framesnet). The reentrant checkpoint assumes all grad tensors are
+                # explicit inputs and double-backwards through those frames; the
+                # non-reentrant implementation tracks closure/module-captured tensors
+                # correctly. (It's also the recommended default in modern torch.)
+                h = checkpoint(fn, h, use_reentrant=False)
+            else:
+                h = block(h, **attn_kwargs)
+        if return_features:
+            return h
+        outputs = self.linear_out(h)
+        if self.sign_branch:
+            fn = partial(self._sign_block_detached, detached_state=detached_state, **attn_kwargs)
+            if self.checkpoint_blocks:
+                hs = checkpoint(fn, h_prev.detach(), use_reentrant=False)
+            else:
+                hs = fn(h_prev.detach())
+            k = self.sign_index
+            # the main readout's column k is dropped, so the sign row of linear_out gets its gradient only from hs,
+            # and the other rows none from hs
+            outputs = torch.cat([outputs[..., :k], self.linear_out(hs)[..., k:k + 1], outputs[..., k + 1:]], dim=-1)
+        return outputs
+
+
+class _BlockStack(nn.Module):
+    """The sign branch of sign_branch_blocks > 1: its blocks applied in order, each with the same attention kwargs."""
+
+    def __init__(self, blocks):
+        super().__init__()
+        self.blocks = nn.ModuleList(blocks)
+
+    def forward(self, x, **attn_kwargs):
+        for b in self.blocks:
+            x = b(x, **attn_kwargs)
+        return x
+
+
+def _detach_frames(frames):
+    """A Frames with the same matrices, det and inv and no autograd graph (identity frames carry none)."""
+    if frames.is_identity:
+        return frames
+    return Frames(matrices=frames.matrices.detach(), is_global=frames.is_global,
+                  det=frames.det.detach(), inv=frames.inv.detach())

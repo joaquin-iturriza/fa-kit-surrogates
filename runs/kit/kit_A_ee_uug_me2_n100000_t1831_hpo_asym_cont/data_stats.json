@@ -1,0 +1,56 @@
+{
+  "mom_div": 0.2837587296962738,
+  "mom_mean": 0.3574087917804718,
+  "mom_std": 1.000000238418579,
+  "amp_trafos": [
+    "log",
+    "standardization"
+  ],
+  "amp_trafos_pp": [
+    [
+      "log",
+      "standardization"
+    ]
+  ],
+  "preprocess_per_dataset": true,
+  "shared_standardization": true,
+  "target_propagators": false,
+  "target_over_born": false,
+  "signedlog_scale_shift": 0.0,
+  "target_physics_factor": false,
+  "target_physics_dim_only": true,
+  "target_physics_eikonal": false,
+  "target_physics_orders": false,
+  "target_physics_orders_source": "diagrams_highest_alphas",
+  "target_physics_hybrid": false,
+  "target_physics_hybrid_cp": null,
+  "target_physics_hybrid_blend": 0.0,
+  "target_physics_alpha_inv": 132.507,
+  "dimensionless_inputs": true,
+  "dimless_mass_stats": [
+    0.0,
+    1.0
+  ],
+  "target_physics_dim_ref": "qperp",
+  "target_physics_s0": 1.0,
+  "target_physics_couplings": null,
+  "tchannel_norm": null,
+  "offshell_stats": [
+    [
+      13.807161536417157,
+      0.0,
+      0.0
+    ],
+    [
+      1.0,
+      1.0,
+      1.0
+    ]
+  ],
+  "prepd_mean": [
+    -13.684905846740437
+  ],
+  "prepd_std": [
+    1.4779579512627166
+  ]
+}

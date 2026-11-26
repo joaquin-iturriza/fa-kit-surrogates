@@ -1,0 +1,743 @@
+"""
+On-demand amplitude dataset materialization for training.
+
+Bridges the experiment to the MG5 generator (`mg5_pipeline_final`): given a
+per-process spec + split role, returns a path to a ready `.npy`, generating it
+reproducibly from a recipe if it is not already present.
+
+Storage policy (Jean Zay):
+  - val / test : FROZEN, persistent on $WORK/datasets. Generated once and reused
+                 forever — the benchmark numbers must be stable across every run.
+  - train      : ephemeral cache on $SCRATCH. Reused across a sweep's trials via
+                 the recipe_id (identical train recipe ⇒ generated at most once);
+                 regenerated only when the recipe changes. $SCRATCH is auto-purged.
+
+Override the directories with env vars AMP_FROZEN_DIR / AMP_TRAIN_CACHE_DIR.
+"""
+import json
+import math
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+import numpy as np
+
+import mg5_pipeline_final as mg
+
+# NLO-virtual generation lives in tools/nlo_virtual_pipeline.py and goes through
+# MadLoop (matrix2py.so), which chdir's and is a process-singleton — so a virt
+# chunk is generated in its own subprocess rather than in a shared pool worker.
+_NLO_PIPELINE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "tools", "nlo_virtual_pipeline.py")
+
+
+def is_virt(process):
+    """True if `process` is an NLO-virtual process routed through MadLoop."""
+    return mg.PROCESSES.get(process, {}).get("kind") == "virt"
+
+# Cost-aware events-per-chunk policy for parallel generation.
+#
+# Chunk boundaries and per-chunk seeds derive ONLY from (recipe, process cost) —
+# never from the worker count — so a dataset is bit-identical whether generated
+# serially or across N cores. The resolved per-process chunk_size is folded into
+# the recipe and into recipe_id (see mg5_pipeline_final.variable_energy_recipe /
+# recipe_id): a different chunk policy yields a different id, so cost-aware data
+# never silently shares an id with the old fixed-100k bytes.
+#
+# Why cost-aware: per-event generation cost grows steeply with final-state
+# multiplicity (a 2→4 point is ~tens of times a 2→2). With a *fixed* events-per-
+# chunk size, an expensive process becomes one fat, indivisible work unit: the
+# whole prebuild then waits on that single slow chunk while every other core sits
+# idle. Sizing each process's chunks for roughly EQUAL WALL-TIME instead spreads
+# the expensive process across many small chunks (fine-grained parallelism, short
+# tail) while leaving cheap processes coarse (low per-chunk overhead). What you
+# ask of each process is "how long it takes", not "how many events".
+#
+# MAX_CHUNK is the old fixed size (cheap 2→2 keeps ~100k-event chunks → unchanged
+# bytes). TARGET_CHUNK_COST is one chunk's worth of work in 2→2-equivalent events;
+# an expensive process gets chunk_size = TARGET / gen_weight (clamped to
+# [MIN_CHUNK, MAX_CHUNK]). The cost model lives in mg5_pipeline_final (next to
+# PROCESSES + the recipe builders, since chunk_size is identity-bearing); these
+# names re-export it for the generation call sites here.
+MAX_CHUNK          = mg.MAX_CHUNK
+MIN_CHUNK          = mg.MIN_CHUNK
+TARGET_CHUNK_COST  = mg.TARGET_CHUNK_COST
+CHUNK_SIZE         = mg.MAX_CHUNK     # back-compat alias (cheap-process chunk size)
+process_gen_weight = mg.process_gen_weight
+process_chunk_size = mg.process_chunk_size
+
+
+def frozen_dir():
+    """Persistent home for frozen val/test datasets."""
+    d = os.environ.get("AMP_FROZEN_DIR")
+    if d:
+        return d
+    work = os.environ.get("WORK")
+    return f"{work}/datasets" if work else mg.OUTPUT_DIR
+
+
+def train_cache_dir():
+    """Purgeable cache for on-demand train datasets (shared across a sweep)."""
+    d = os.environ.get("AMP_TRAIN_CACHE_DIR")
+    if d:
+        return d
+    scratch = os.environ.get("SCRATCH")
+    if scratch:
+        return f"{scratch}/amp_data_cache"
+    job = os.environ.get("JOBSCRATCH")
+    if job:
+        return f"{job}/amp_data_cache"
+    return frozen_dir()
+
+
+def dest_for_role(role):
+    return frozen_dir() if role in ("val", "test") else train_cache_dir()
+
+
+def _virt_standalone_dir(process):
+    base = mg.PROCESSES[process]["virt_base"]
+    return f"{mg.WORK_DIR}/{base}_virt_standalone"
+
+
+def ensure_virt_backend(process):
+    """Build the [virt=QCD] MadLoop standalone (matrix2py.so) for an NLO-virtual
+    process if absent, then pole-certify it. Idempotent; run serially before the
+    pool, like the LO backends."""
+    base = mg.PROCESSES[process]["virt_base"]
+    sa   = _virt_standalone_dir(process)
+    import glob
+    # A built module is reused only once certified: a build whose pole check failed leaves its module behind, and the
+    # rerun after the failure must certify it again, not generate from it (catalog_4's first regeneration). Required
+    # for catalog_4 (v4_*) only; older standalones predate the marker.
+    certified = os.path.exists(f"{sa}/.certified") or not base.startswith("v4_")
+    if glob.glob(f"{sa}/SubProcesses/P0_*/matrix2py*.so") and certified:
+        return sa
+    env = dict(os.environ, SETUPTOOLS_USE_DISTUTILS="stdlib")
+    subprocess.run([sys.executable, _NLO_PIPELINE, base, "--build", "--certify"],
+                   check=True, env=env)
+    return sa
+
+
+def _backend_key(process):
+    """What a process compiles: virt entries their [virt=QCD] standalone, LO entries the
+    standalone of mg.standalone_name (a coupling-only scan shares its base's)."""
+    if is_virt(process):
+        return "virt:" + mg.PROCESSES[process]["virt_base"]
+    return "lo:" + mg.standalone_name(process)
+
+
+def ensure_backends(processes, workers=8, failed=None):
+    """ensure_backend over many processes in parallel: one job per DISTINCT backend
+    (dedup by _backend_key), each in its own subprocess. Backends live in distinct
+    standalone dirs and neither MadGraph output nor g++/f2py share any state, so this is
+    safe; the serial re-patch of a name-keyed own backend still happens in ensure_backend.
+    Returns {process: standalone_dir}.
+
+    `failed` (a dict) makes a one-loop backend whose build or pole certification fails a recorded failure instead of
+    an abort: failed[backend_key] = reason, and no process of that backend is in the result. LO backends still raise."""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import time
+    reps = {}
+    for p in processes:
+        reps.setdefault(_backend_key(p), p)
+    print(f"Ensuring {len(reps)} distinct backends for {len(processes)} processes ({workers} in parallel)...")
+    t0 = time.time(); out = {}
+    with ProcessPoolExecutor(max_workers=max(1, workers)) as ex:
+        futs = {ex.submit(ensure_backend, p): p for p in reps.values()}
+        for fut in as_completed(futs):
+            p = futs[fut]
+            try:
+                out[p] = fut.result()
+            except subprocess.CalledProcessError as e:
+                if failed is None or not is_virt(p):
+                    raise
+                why = ("pole certification FAIL" if e.returncode == 2
+                       else f"one-loop build failed (exit {e.returncode})")
+                failed[_backend_key(p)] = f"{why}: {mg.PROCESSES[p]['virt_base']}"
+                print(f"  backend {p:24s} FAILED ({why}; {time.time()-t0:6.1f}s elapsed)", flush=True)
+                continue
+            print(f"  backend {p:24s} ready  ({time.time()-t0:6.1f}s elapsed)", flush=True)
+    # every process (not only the representatives) gets its param card re-patched
+    for p in processes:
+        if p not in out and not (failed and _backend_key(p) in failed):
+            out[p] = ensure_backend(p)
+    return out
+
+
+def ensure_backend(process):
+    """Compile the matrix-element backend for `process` if it isn't built yet.
+
+    Run this serially (once per unique process) before parallel generation so
+    that concurrent workers never race to compile the same backend. A synthetic
+    process has none: its structure (and diagram sidecar) is fixed by its name."""
+    if mg.is_synthetic(process):
+        mg.register_synthetic(process)
+        return None
+    if mg.is_kit(process):   # a KIT pool is cut from its HDF5 file (build_dataset): no generator to compile
+        return None
+    if is_virt(process):
+        return ensure_virt_backend(process)
+    # A coupling-only scan shares its base's compiled standalone (see
+    # mg.standalone_name): compile under that key with the base's cfg.
+    sa  = mg.standalone_name(process)
+    cfg = dict(mg.PROCESSES[sa])
+    standalone_dir = f"{mg.WORK_DIR}/{sa}_standalone"
+    backend, subproc_dirs, driver_bin, _ = mg.detect_compiled_backend(standalone_dir)
+    if not subproc_dirs or (backend == "cpp" and driver_bin is None):
+        mg.generate_mg5_process(sa, cfg)
+        mg.compile_backends(standalone_dir, cfg["nfinal"] + 2)
+    # A name-keyed OWN backend (mass/EW scan: sa == process) may be reused across
+    # recipe versions with different masses; re-patch its param_card to THIS dataset's
+    # physics every time (the compile step only patches on first build). Shared
+    # coupling-only scans (sa == base) keep the base card — α_s(√s; α_s(M_Z)) is set
+    # per event inside the ME, not through the card — so they are left untouched.
+    if sa == process:
+        mg.repatch_standalone_param_cards(standalone_dir, cfg)
+    return standalone_dir
+
+
+def _is_cached(out_path, wanted_id):
+    """True if `out_path` already holds the dataset for recipe_id `wanted_id`."""
+    try:
+        with open(out_path + ".recipe.json") as f:
+            return json.load(f).get("recipe_id") == wanted_id
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+
+
+def plan_chunks(n_events, chunk_size=None):
+    """Split n_events into as few, as-equal chunks as the policy allows.
+    Boundaries depend only on (n_events, chunk_size), never the worker count.
+    Pass a per-process `chunk_size` (from process_chunk_size) for cost-aware
+    granularity; defaults to the cheap-process MAX_CHUNK."""
+    if chunk_size is None:
+        chunk_size = MAX_CHUNK
+    nch = max(1, math.ceil(n_events / chunk_size))
+    return split_counts(n_events, nch)
+
+
+def split_counts(n_events, nch):
+    """Split n_events into `nch` near-equal contiguous counts (deterministic)."""
+    base, rem = divmod(n_events, nch)
+    return [base + (1 if i < rem else 0) for i in range(nch)]
+
+
+def _child_seed(base_seed, role, idx):
+    """Deterministic per-chunk seed from (base_seed, role, chunk index)."""
+    off = mg.ROLE_SEED_OFFSET.get(role, 0)
+    return int(np.random.SeedSequence([int(base_seed), int(off), int(idx)])
+               .generate_state(1, dtype=np.uint32)[0])
+
+
+def chunk_tasks(process, sqrts_min, sqrts_max, n_events, role, seed, work_dir):
+    # NB: process_gen_weight is the FLAT per-event cost; a mixture pool labels ~3x as many
+    # events (bulk + oversampled candidates). Deliberately not folded into the weight: the
+    # weight sets n_chunks, which is part of the train recipe identity, so changing it would
+    # mint new ids for every existing pool. It only mis-sizes LPT scheduling against virt.
+    """Independent chunk work-units for one (process, role) dataset. Each is a
+    self-contained dict that gen_chunk() can run in any worker / any order."""
+    tasks = []
+    weight = process_gen_weight(process)
+    # NLO-virtual is generated as one unit (see mg.process_n_chunks); LO uses the
+    # cost-aware split. Both go through the same per-chunk seed / identity machinery.
+    nch    = mg.process_n_chunks(process, n_events)
+    counts = split_counts(n_events, nch)
+    pol    = mg.sampling_policy(mg.PROCESSES.get(process, {}), role) if process in mg.PROCESSES else {}
+    f_def  = float(pol.get("f_default", 0))
+    # the default-sampled share (mg.default_share_rows): each chunk reads its own consecutive rows
+    drows  = mg.default_share_rows(f_def, counts) if f_def > 0 else [None] * len(counts)
+    for idx, count in enumerate(counts):
+        tasks.append({
+            "process":   process,
+            "sqrts_min": float(sqrts_min),
+            "sqrts_max": float(sqrts_max),
+            "count":     int(count),
+            "seed":      _child_seed(seed, role, idx),
+            "role":      role,                  # val/test always sample flat (sampling_policy)
+            "out_dir":   os.path.join(work_dir, f"c{idx:04d}"),
+            "idx":       idx,
+            # est_cost: relative wall-time of this chunk (events × per-event
+            # weight), in 2→2-equivalent events. For LPT scheduling + reporting
+            # only — never touches the data.
+            "est_cost":  float(count) * weight,
+            **({"default_rows": list(drows[idx]), "default_seed": seed} if drows[idx] is not None else {}),
+        })
+    return tasks
+
+
+def gen_virt_chunk(task):
+    """Worker: generate one NLO-virtual chunk in an isolated subprocess (MadLoop's
+    matrix2py.so chdir's and is a process-singleton, so it can't be loaded in a
+    shared pool worker). Deterministic via the per-chunk seed. Returns (idx, path).
+
+    NLO datasets are one unit each (mg.process_n_chunks), so only a few of these
+    run at once; the retry is belt-and-suspenders against the transient numpy
+    C-extension import race that fresh interpreters can hit under FS contention
+    (PyCapsule_Import 'datetime'). The seed is fixed, so a retry is identical."""
+    process = task["process"]
+    cfg     = mg.PROCESSES[process]
+    base    = cfg["virt_base"]
+    os.makedirs(task["out_dir"], exist_ok=True)
+    out_path = os.path.join(task["out_dir"], "chunk.npy")
+    env = dict(os.environ, SETUPTOOLS_USE_DISTUTILS="stdlib",
+               PYTHONDONTWRITEBYTECODE="1")
+    cmd = [sys.executable, _NLO_PIPELINE, base, "--generate",
+           "--n", str(task["count"]), "--seed", str(task["seed"]),
+           "--sqrts-min", repr(task["sqrts_min"]), "--sqrts-max", repr(task["sqrts_max"]),
+           "--out", out_path]
+    if cfg.get("sqrts_measure"):   # the recipe entry's measure (log_beta), not only the one-loop table entry's
+        cmd += ["--sqrts-measure", str(cfg["sqrts_measure"])]
+    # Per-dataset α_s scan (register_scan_process sets alphas_mz/alphas_prefactor on
+    # a virt scan): restore the physical α_s weighting at the scanned reference so
+    # the NLO target depends on the coupling. The α_s scan shares the base virt
+    # standalone (no rebuild — c0 is α_s-independent).
+    if cfg.get("alphas_prefactor"):
+        cmd += ["--alphas-mz", repr(float(cfg.get("alphas_mz", 0.118))),
+                "--alphas-prefactor"]
+    import time
+    if _chunk_done(out_path, task["count"]):
+        return task["idx"], out_path
+    last = None
+    t0 = time.perf_counter()
+    for attempt in range(4):
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        if r.returncode == 0 and _chunk_done(out_path, task["count"]):
+            _report_chunk_time(task, time.perf_counter() - t0)
+            return task["idx"], out_path
+        if r.returncode == 0:
+            # a Fortran STOP inside MadLoop ends the interpreter with exit 0 and no chunk: a failure, not a success
+            raise RuntimeError(f"gen_virt_chunk: {process} exited 0 without its chunk (MadLoop STOP?):\n"
+                               f"{(r.stdout or '')[-1500:]}\n{(r.stderr or '')[-500:]}")
+        last = r.stderr[-2000:]
+        if r.returncode in (2, 3):
+            # 2 = certification FAIL, 3 = per-event pole guard: deterministic at this
+            # seed, retrying would only burn hours of MadLoop.
+            raise RuntimeError(f"gen_virt_chunk: {process} refused by the pole guard (exit {r.returncode}):\n{last}")
+        time.sleep(1.5 * (attempt + 1))   # brief stagger; race is transient
+    raise RuntimeError(f"gen_virt_chunk failed for {process} after 4 tries:\n{last}")
+
+
+def gen_chunk(task):
+    """Worker: generate one chunk into its own temp dir. The backend must already
+    be compiled (call ensure_backend first). Returns (idx, chunk_npy_path).
+
+    Calls build_dataset_variable_energy directly (NOT generate_from_recipe) so a
+    worker writes only its own chunk .npy — no .recipe.json / manifest.json
+    update, which would race across the pool. The single recipe/manifest write
+    happens once, serially, in finalize_dataset."""
+    process        = task["process"]
+    if is_virt(process):
+        return gen_virt_chunk(task)
+    # cfg is the SCAN's (its alphas_mz / m_finals drive the per-event computation),
+    # but the compiled backend dir may be the shared base (mg.standalone_name): a
+    # coupling-only scan has base-identical masses/EW, so the base param_card is
+    # correct and α_s is applied per event. A synthetic process is labelled by
+    # tools/synthetic_amplitudes.py (registered here too: a spawned worker starts empty).
+    if mg.is_synthetic(process):
+        cfg = dict(mg.register_synthetic(process))
+        backend, subproc_dirs, driver_bin, eff_dir = "synthetic", ["synthetic"], None, None
+    else:
+        cfg            = dict(mg.PROCESSES[process])
+        standalone_dir = f"{mg.WORK_DIR}/{mg.standalone_name(process)}_standalone"
+        backend, subproc_dirs, driver_bin, eff_dir = mg.detect_compiled_backend(standalone_dir)
+    if not subproc_dirs or (backend == "cpp" and driver_bin is None):
+        raise RuntimeError(
+            f"gen_chunk: backend for {process} not compiled — call ensure_backend first.")
+    os.makedirs(task["out_dir"], exist_ok=True)
+    out_path = os.path.join(task["out_dir"], "chunk.npy")
+    if _chunk_done(out_path, task["count"]):
+        return task["idx"], out_path
+    rng = np.random.default_rng(task["seed"])
+    import time
+    t0 = time.perf_counter()
+    mg.FLAT_LAST.clear()
+    mg.build_dataset_variable_energy(
+        task["count"], task["sqrts_min"], task["sqrts_max"],
+        eff_dir, backend, subproc_dirs, driver_bin, cfg, out_path, rng=rng, role=task.get("role"),
+        default_rows=task.get("default_rows"), default_seed=task.get("default_seed"))
+    _report_chunk_time(task, time.perf_counter() - t0)
+    _write_flat_fill(out_path, time.perf_counter() - t0)
+    return task["idx"], out_path
+
+
+FLAT_FILL_KEYS = ("quota", "kept_per_bin", "cand_per_bin", "budget_hit", "stop", "n_candidates", "n_labels",
+                  "t_propose", "t_label", "kept_per_channel_bin", "channels", "rounds")
+
+
+def _write_flat_fill(out_path, secs):
+    """The quota-filled flat part's fill of this chunk (mg.FLAT_LAST, set by the quota sampler: a pool with
+    sampling.flat_range) beside the chunk, so the assembled pool carries it (<pool>.flatfill.json, finalize_dataset):
+    the regeneration's read of bins left short (plan catalog_coverage step 65). Nothing written for other pools."""
+    d = mg.FLAT_LAST
+    if "quota" not in d:
+        return
+    def _j(x):
+        x = x.tolist() if hasattr(x, "tolist") else x
+        return [_j(v) for v in x] if isinstance(x, (list, tuple)) else (bool(x) if isinstance(x, np.bool_) else x)
+    rec = {k: _j(d.get(k)) for k in FLAT_FILL_KEYS}
+    rec["edges_log10"] = (np.asarray(d["edges"], float) / np.log(10.0)).tolist()
+    rec["chunk_seconds"] = float(secs)
+    with open(out_path[:-len(".npy")] + ".flatfill.json", "w") as f:
+        json.dump(rec, f)
+
+
+def _chunk_done(out_path, count):
+    """A chunk already on disk with the right row count is reused: chunk dirs and seeds
+    are deterministic functions of the recipe, so a rerun after an aborted pool (a fork
+    failure once threw away 9281 finished chunks) only generates what is missing. A
+    truncated file from a killed worker fails the shape check and is regenerated."""
+    if not os.path.exists(out_path):
+        return False
+    try:
+        arr = np.load(out_path, mmap_mode="r")
+        ok = arr.ndim == 2 and arr.shape[0] == count
+    except Exception:
+        ok = False
+    if ok:
+        print(f"[TIME] {os.path.basename(os.path.dirname(out_path))} reused: {count} events already on disk", flush=True)
+    return ok
+
+
+def _report_chunk_time(task, dt):
+    """One line per finished chunk with its wall time: the only measured input for costing
+    a recipe (the cost model's weights are relative, this is seconds)."""
+    n = task["count"]
+    print(f"[TIME] {task['process']:28s} {str(task.get('role')):5s} chunk {task['idx']:3d}: "
+          f"{n:7d} events in {dt:8.1f}s  ({n / max(dt, 1e-9):8.1f} ev/s)", flush=True)
+
+
+def finalize_dataset(process, sqrts_min, sqrts_max, n_events, role, seed,
+                     ordered_chunk_paths, dest_dir, work_dir):
+    """Concatenate chunk files (in index order) into the canonical dataset +
+    .recipe.json (written with the ORIGINAL recipe, so recipe_id matches the
+    non-chunked path and the cache key is unchanged). Removes the temp work dir."""
+    rec   = mg.variable_energy_recipe(process, sqrts_min, sqrts_max, n_events,
+                                      role=role, seed=seed)
+    final = mg.recipe_output_path(rec, dest_dir)
+    os.makedirs(os.path.dirname(final) or ".", exist_ok=True)
+    data = np.concatenate([np.load(p) for p in ordered_chunk_paths], axis=0)
+    tmp  = final + ".tmp.npy"
+    np.save(tmp, data)
+    os.replace(tmp, final)
+    # a one-loop pool's Born per event (tools/nlo_virtual_pipeline.born_path), kept when every chunk wrote one
+    borns = [p[:-len(".npy")] + ".born.npy" for p in ordered_chunk_paths]
+    # wrote_born gates the record below: a predecessor's sidecar left on disk keeps its old record, so a read refuses it
+    wrote_born = is_virt(process) and all(os.path.exists(b) for b in borns)
+    if wrote_born:
+        np.save(final[:-len(".npy")] + ".born.npy", np.concatenate([np.load(b) for b in borns]))
+    # the quota-filled flat part's fill per chunk (_write_flat_fill), kept when every chunk wrote one
+    # (one written when any chunk has one; a chunk without it, e.g. reused after a kill between its .npy and its fill,
+    # is a null entry and a [WARN], so the read sees the gap)
+    fills = [p[:-len(".npy")] + ".flatfill.json" for p in ordered_chunk_paths]
+    have = [os.path.exists(f) for f in fills]
+    if any(have):
+        if not all(have):
+            print(f"[WARN] flat fill: {os.path.basename(final)}: chunks {[i for i, h in enumerate(have) if not h]} "
+                  f"have no .flatfill.json (null entries)", flush=True)
+        with open(final[:-len(".npy")] + ".flatfill.json", "w") as f:
+            json.dump({"chunks": [json.load(open(x)) if h else None for x, h in zip(fills, have)]}, f)
+    full = dict(rec)
+    full["effective_seed"] = seed + mg.ROLE_SEED_OFFSET.get(role, 0)
+    full["chunked"]        = True
+    # n_chunks (in `rec` when non-legacy) carries the identity; record the nominal
+    # chunk_size + gen_weight as excluded traceability metadata.
+    full["chunk_size"]     = process_chunk_size(process)
+    full["gen_weight"]     = process_gen_weight(process)
+    mg.write_recipe(final, full)
+    if wrote_born:
+        # the Born sidecar's identity record (experiment._born_of_pool asserts it), written after the .recipe.json it
+        # reads: without it a regenerated pool kept the record of the pool it replaced and every V/B run on it was
+        # refused (b b~ > Z Z, 2026-11-12)
+        from keyed_aug import pool_identity
+        with open(final[:-len(".npy")] + ".born.npy.json", "w") as fh:
+            json.dump({"pool_identity": pool_identity(final), "n_rows": int(data.shape[0])}, fh)
+    shutil.rmtree(work_dir, ignore_errors=True)
+    return final
+
+
+def is_reweightable_virt_scan(process):
+    """True for an NLO α_s-scan dataset that can be DERIVED from its stripped base
+    by reweighting instead of re-running MadLoop: a virt process with the physical
+    α_s prefactor on, a scan_base, and unchanged masses (mass scans change the
+    kinematics/coefficient, so they are not reweightable)."""
+    cfg = mg.PROCESSES.get(process, {})
+    base = cfg.get("scan_base")
+    if not (cfg.get("kind") == "virt" and cfg.get("alphas_prefactor") and base):
+        return False
+    return list(cfg.get("m_finals", [])) == list(mg.PROCESSES.get(base, {}).get("m_finals", []))
+
+
+def reweight_virt_alphas(parent_npy, process, out_npy):
+    """Write the α_s-scanned NLO dataset for ``process`` by reweighting its stripped
+    parent (``parent_npy``), event by event:
+
+        target = virt_e4 · (α_s(√s; amz)/0.118)^b · α_s(√s; amz)/(2π),  b = alphas_power−1
+
+    This is EXACT: the MadLoop loop coefficient c0 is α_s-independent, the parent's
+    born was evaluated at the 0.118 reference, and (α_s/0.118)^b restores the born's
+    own α_s running (b=0 for 2→2 qqbar, 1 for 2→3 qqg). √s is recovered from the two
+    incoming momenta (rows 0,1)."""
+    cfg = mg.PROCESSES[process]
+    amz = float(cfg["alphas_mz"])
+    b   = int(cfg.get("alphas_power", 1)) - 1
+    REF = 0.118
+    npart = int(cfg["nfinal"]) + 2
+    d = np.load(parent_npy)
+    mom = d[:, :npart * 4].reshape(-1, npart, 4)
+    pin = mom[:, 0, :] + mom[:, 1, :]
+    s = pin[:, 0] ** 2 - (pin[:, 1:] ** 2).sum(axis=1)
+    asr = mg.compute_alphas(np.sqrt(np.abs(s)), alphas_mz=amz)
+    factor = (asr / REF) ** b * (asr / (2.0 * np.pi))
+    out = d.copy()
+    out[:, -1] = d[:, -1] * factor
+    tmp = out_npy + ".tmp.npy"
+    np.save(tmp, out)
+    os.replace(tmp, out_npy)
+    return out_npy
+
+
+def ensure_dataset(process, sqrts_min, sqrts_max, n_events, role, seed,
+                   dest_dir=None, require_cache=False):
+    """Path to the (process, role) dataset, generated reproducibly if absent
+    (cache hit otherwise). `role` in {'train','val','test'}.
+
+    Generation goes through the chunked path (serially here, in parallel in the
+    prebuild) — same bytes either way. If `require_cache` is set, a missing/stale
+    dataset raises instead of being generated, so GPU training jobs never burn GPU
+    time materializing data (run the prebuild job first)."""
+    if dest_dir is None:
+        dest_dir = dest_for_role(role)
+    recipe = mg.variable_energy_recipe(
+        process, sqrts_min, sqrts_max, n_events, role=role, seed=seed)
+    out    = mg.recipe_output_path(recipe, dest_dir)
+    wanted = mg.recipe_id(recipe)
+
+    if mg.is_kit(process):
+        # a KIT benchmark pool is a read of its HDF5 file (seconds), never generation: built even under require_cache;
+        # its per-event alpha_s sidecar (the file's fixed alpha_s) is written for pools cached before it existed too
+        from tools import kit_hardps
+        if not _is_cached(out, wanted):
+            kit_hardps.build_pool(recipe, out)
+            full = dict(recipe)
+            full["physics"] = {"source": "kit_hardps", "file": recipe["kit_file"], "target": recipe["kit_target"]}
+            mg.write_recipe(out, full)
+        kit_hardps.ensure_alphas(recipe, out)
+        kit_hardps.ensure_born(recipe, out)
+        return out
+    if _is_cached(out, wanted):
+        return out
+    if float((recipe.get("sampling") or {}).get("f_default", 0)) > 0:
+        # a default-share mixture is composed at load from the entry's catalog_4 pool and its default_source's lhe
+        # pools (mix_compose.py; the user, 2026-10-31: no stored copy per mixture); a stored one is still read above
+        import mix_compose
+        return mix_compose.ensure_composed(process, sqrts_min, sqrts_max, n_events, role, seed, recipe, out)
+    if require_cache:
+        raise RuntimeError(
+            f"require_cache: dataset for ({process}, {role}, {n_events} ev) "
+            f"not prebuilt at {out} (recipe_id={wanted}). Run the prebuild "
+            f"job first: sbatch prebuild_recipes.sh <spec.yaml>.")
+
+    if (recipe.get("sampling") or {}).get("mode") == "steered":
+        raise RuntimeError(f"{out}: a steered pool is not generated here; build it with "
+                           f"tools/steer_pool.py (recipe_id {wanted})")
+
+    # MadEvent pp events (catalog_pp): one MadEvent run feeds every role, so build the other
+    # roles' default pools from the same run while at it (prebuild_recipes does this in parallel).
+    if mg.is_lhe_pp(process):
+        return ensure_lhe_pp(process, {role: (n_events, dest_dir)}, seed, sqrts_min, sqrts_max)[role]
+
+    # NLO α_s scan: derive from the stripped base by reweighting (ONE MadLoop run
+    # per base feeds all its α_s points) instead of re-running MadLoop per point.
+    if is_reweightable_virt_scan(process):
+        parent = mg.PROCESSES[process]["scan_base"]
+        parent_path = ensure_dataset(parent, sqrts_min, sqrts_max, n_events,
+                                     role, seed, dest_dir, require_cache=False)
+        reweight_virt_alphas(parent_path, process, out)
+        full = dict(recipe)
+        full["derived_from"] = os.path.basename(parent_path)
+        mg.write_recipe(out, full)
+        return out
+
+    ensure_backend(process)
+    work    = os.path.join(dest_dir, f".chunks_{wanted}")
+    results = dict(gen_chunk(t) for t in
+                   chunk_tasks(process, sqrts_min, sqrts_max, n_events, role, seed, work))
+    ordered = [results[i] for i in sorted(results)]
+    return finalize_dataset(process, sqrts_min, sqrts_max, n_events, role, seed,
+                            ordered, dest_dir, work)
+
+
+def lhe_pp_items(process, wants, seed, sqrts_min, sqrts_max, fill_defaults=True):
+    """[(recipe, out_path)] still to build for an lhe_pp process. `wants` = {role: (n_events,
+    dest_dir or None)}; with `fill_defaults`, the roles not asked are added at the catalog's block
+    sizes (lhe n_val/n_test/n_train) in their default directories, since they come from the same
+    MadEvent run. Cached pools are left out."""
+    cfg = mg.PROCESSES[process]
+    full = dict(wants)
+    if fill_defaults:
+        for r, (lo, hi) in mg.lhe_layout(cfg).items():
+            full.setdefault(r, (hi - lo, None))
+    items = {}
+    for r, (n, dest) in full.items():
+        rec = mg.variable_energy_recipe(process, sqrts_min, sqrts_max, n, role=r, seed=seed)
+        out = mg.recipe_output_path(rec, dest or dest_for_role(r))
+        items[r] = (rec, out, _is_cached(out, mg.recipe_id(rec)))
+    return items
+
+
+def ensure_lhe_pp(process, wants, seed, sqrts_min, sqrts_max, mg_cores=1):
+    """Paths {role: npy} of an lhe_pp process's pools for `wants` = {role: (n_events, dest_dir)},
+    built (with the other roles' default pools) from one MadEvent run when any is missing."""
+    items = lhe_pp_items(process, wants, seed, sqrts_min, sqrts_max)
+    todo = [(rec, out) for rec, out, cached in items.values() if not cached]
+    if todo:
+        mg.build_lhe_pp(process, todo, mg_cores=mg_cores)
+    return {r: items[r][1] for r in wants}
+
+
+def build_lhe_pp_job(job):
+    """Pool worker of prebuild_recipes: one lhe_pp process, sidecars left to the parent (the
+    manifest upsert is not safe across processes). Never raises: returns
+    (process, [(out, full_recipe)], error or None, seconds)."""
+    import time, traceback
+    process, todo, mg_cores = job["process"], job["items"], job.get("mg_cores", 1)
+    t0 = time.time()
+    try:
+        res = mg.build_lhe_pp(process, todo, mg_cores=mg_cores, write_sidecars=False)
+        return process, res, None, time.time() - t0
+    except BaseException as e:          # compile_backends sys.exit()s on a failed g++
+        return process, [], f"{type(e).__name__}: {e}\n{traceback.format_exc()[-1500:]}", time.time() - t0
+
+
+def composed_record(paths):
+    """{role: {process: derived_from}} of the pools in `paths` ({role: {process: npy}}) that were composed at load
+    (mix_compose.ensure_composed: the stored pool's recipe id, the control pool and its recipe id, the shares)."""
+    out = {}
+    for role, by in paths.items():
+        for name, pth in by.items():
+            try:
+                der = json.load(open(pth + ".recipe.json")).get("derived_from") or {}
+            except (OSError, ValueError):
+                continue
+            if der.get("composed_at_load"):
+                out.setdefault(role, {})[name] = der
+    return out
+
+
+def _sqrts_and_logm2(pth):
+    """sqrt(s_hat) (the two incoming legs) and ln|M|^2 of every row of a pool."""
+    a = np.load(pth, mmap_mode="r"); n = (a.shape[1] - 1) // 5
+    p = np.asarray(a[:, :8]).reshape(-1, 2, 4).sum(1)
+    return np.sqrt(np.maximum(p[:, 0] ** 2 - (p[:, 1:] ** 2).sum(1), 0)), np.log(np.abs(np.asarray(a[:, -1])))
+
+
+def mixed_generation(paths, z_max=5.0, n_bins=10, any_version=False):
+    """{process: {role: {train, other, z, shift}}} for the processes in `paths` ({role: {process: npy}}) whose train
+    and val/test pools come from different generator versions (provenance.pipeline_sha256 of the .recipe.json
+    sidecars) AND whose labels disagree: per sqrt(s_hat) decile of the val/test pool, z_i = (median ln|M|^2 of train -
+    that of val/test) / its standard error (1.2533 std / sqrt(n) per pool); flagged when |sum z_i| / sqrt(n_bins) >
+    z_max (a shift of one sign across the energy range). The version alone does not decide: the generator file changes
+    far more often than its labels (26 of 28 processes of the zng parent, 74 of 1153 of trial 1262 differ in
+    version). On the zng parent's pools u u~ -> t t~ (one loop), its train pool regenerated with a ~1% label shift,
+    reads z = 8.3 (val) and 6.1 (test); the other 25 processes of the parent and the 74 of trial 1262 at most 2.7
+    (zng_uq_benchmark, analysis/zng_uq/data/mixed_generation_z.json). any_version: compare whatever the versions (a
+    train pool rebuilt on another site's MadGraph: the version is not in the sha); z_max=0 returns every process's z."""
+    by = {}
+    for role, d in paths.items():
+        for name, pth in d.items():
+            try:
+                sha = (json.load(open(pth + ".recipe.json")).get("provenance") or {}).get("pipeline_sha256")
+            except (OSError, ValueError):
+                continue
+            if sha:
+                by.setdefault(name, {})[role] = (sha, pth)
+    out = {}
+    for name, r in by.items():
+        if "train" not in r or (not any_version and len({v[0] for v in r.values()}) < 2):
+            continue
+        from keyed_aug import pool_identity, pool_stub
+        stub = pool_stub(r["train"][1])
+        if stub is not None:
+            # the train pool is absent here: its stub carries this check as run beside it, against the val/test
+            # pools it names (tools/check_pp_pools.py --write-stubs); valid only for those same pools
+            rec = stub["mixed_generation"]      # every role's z (any_version=True, z_max=0) and the pools it read
+            for role in ("val", "test"):
+                if role not in r or (not any_version and r[role][0] == r["train"][0]):
+                    continue
+                assert rec["against"].get(role) == pool_identity(r[role][1]), \
+                    f"{r['train'][1]}: its stub's label check was made against another {role} pool; rewrite the stub"
+                z = rec["z"].get(role)
+                if z is not None and abs(z["z"]) > z_max:
+                    out.setdefault(name, {})[role] = z
+            continue
+        s_tr, l_tr = _sqrts_and_logm2(r["train"][1])
+        for role in ("val", "test"):
+            if role not in r or (not any_version and r[role][0] == r["train"][0]):
+                continue
+            s_e, l_e = _sqrts_and_logm2(r[role][1])
+            edges = np.quantile(s_e, np.linspace(0, 1, n_bins + 1)); edges[-1] += 1e-9
+            zs, ds = [], []
+            for lo, hi in zip(edges[:-1], edges[1:]):
+                a, b = l_tr[(s_tr >= lo) & (s_tr < hi)], l_e[(s_e >= lo) & (s_e < hi)]
+                if len(a) < 20 or len(b) < 20:
+                    continue
+                se = 1.2533 * np.hypot(a.std() / np.sqrt(len(a)), b.std() / np.sqrt(len(b)))
+                ds.append(float(np.median(a) - np.median(b))); zs.append(ds[-1] / se if se > 0 else 0.0)
+            z = float(np.sum(zs) / np.sqrt(len(zs))) if zs else 0.0
+            if abs(z) > z_max:
+                out.setdefault(name, {})[role] = dict(train=r["train"][0][:8], other=r[role][0][:8], z=round(z, 2),
+                                                      shift=float(np.median(ds)))
+    return out
+
+def _needs_compose(s, role, seed, dest_dir):
+    recipe = mg.variable_energy_recipe(s["process"], s["sqrts_min"], s["sqrts_max"], s["n_events"], role=role, seed=seed)
+    if float((recipe.get("sampling") or {}).get("f_default", 0)) <= 0:
+        return False
+    out = mg.recipe_output_path(recipe, dest_dir or dest_for_role(role))
+    if _is_cached(out, mg.recipe_id(recipe)):
+        return False
+    import mix_compose
+    return not _is_cached(os.path.join(mix_compose.compose_dir(), os.path.basename(out)), mg.recipe_id(recipe))
+
+
+def _compose_one(a):
+    s, role, seed, dest_dir = a
+    return ensure_dataset(s["process"], s["sqrts_min"], s["sqrts_max"], s["n_events"], role=role, seed=seed,
+                          dest_dir=dest_dir)
+
+
+def _compose_parallel(specs, role, seed, dest_dir):
+    """Compose the default-share pools of `specs` that are not composed yet, in parallel (fork: the processes the
+    recipe registered in mg.PROCESSES carry over); a worker's error is raised here."""
+    todo = [s for s in specs if _needs_compose(s, role, seed, dest_dir)]
+    try:
+        ncpu = len(os.sched_getaffinity(0))
+    except AttributeError:
+        ncpu = os.cpu_count() or 1
+    n = min(len(todo), ncpu)
+    if n < 2:
+        return
+    import multiprocessing as mp
+    t0 = time.time()
+    with mp.get_context("fork").Pool(n) as pool:
+        for _ in pool.imap_unordered(_compose_one, [(s, role, seed, dest_dir) for s in todo]):
+            pass
+    print(f"[mix_compose] {len(todo)} {role} pools composed on {n} CPUs in {time.time() - t0:.1f} s", flush=True)
+
+
+def ensure_split_set(specs, role, seed, dest_dir=None, require_cache=False):
+    """Materialize a list of process specs for one role.
+
+    `specs`: iterable of dicts {process, sqrts_min, sqrts_max, n_events}.
+    Returns {process: npy_path}. Default-share mixtures not yet composed (mix_compose.py) are composed first in
+    parallel over the job's CPUs (one pool per worker, the same files the serial path writes), then read as cache hits.
+    """
+    _compose_parallel(list(specs), role, seed, dest_dir)
+    return {
+        s["process"]: ensure_dataset(
+            s["process"], s["sqrts_min"], s["sqrts_max"], s["n_events"],
+            role=role, seed=seed, dest_dir=dest_dir, require_cache=require_cache)
+        for s in specs
+    }

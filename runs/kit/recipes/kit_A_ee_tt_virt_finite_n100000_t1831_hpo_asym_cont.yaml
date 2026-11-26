@@ -1,0 +1,8 @@
+processes:
+- n_test: 200000
+  n_train: 100000
+  n_val: 10
+  name: kit_ee_tt__virt_finite
+  sqrts:
+  - 346
+  - 50000

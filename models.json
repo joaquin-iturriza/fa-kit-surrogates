@@ -1,0 +1,23 @@
+{
+ "commit": "d9e647f6c74b1cc755ed884a4e693f3c89f74cfd",
+ "models": [
+  {
+   "run": "kit_A_ee_uug_me2_n100000_t1831_hpo_asym_cont",
+   "label": "",
+   "file": "ee_uug",
+   "target": "me2"
+  },
+  {
+   "run": "kit_A_ee_uugg_me2_n100000_t1831_hpo_asym_cont",
+   "label": "",
+   "file": "ee_uugg",
+   "target": "me2"
+  },
+  {
+   "run": "kit_A_ee_tt_virt_finite_n100000_t1831_hpo_asym_cont",
+   "label": "",
+   "file": "ee_tt",
+   "target": "virt_finite"
+  }
+ ]
+}

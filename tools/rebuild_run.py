@@ -1,0 +1,310 @@
+"""Rebuild a finished run for inference on another split: the run's own config (so its own train pool,
+momentum scale, target factors and amplitude stats) with one role's pool file replaced, and its best
+checkpoint loaded. Used by tools/steer_pool.py (the reference model scores candidates) and
+analysis/transfer/cross_eval.py (a run scored on another recipe's test split).
+
+The rebuilt statistics are checked against the run's frozen data_stats.json, which is the evidence
+that the inputs go through exactly the run's preprocessing. The off-shellness feature's column stats are
+fitted on every role together, so they are pinned to the run's own (data.offshell_stats; from
+data_stats.json, or for older runs a build on the run's own pools): a swapped split otherwise shifts
+every event's input (the steering cross-pool offset, docs/results.tex sec:ladder).
+"""
+import copy, gzip, io, json, os, sys, tempfile
+import atexit, shutil
+
+import numpy as np
+import torch
+import yaml
+from omegaconf import OmegaConf, open_dict
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+import datagen  # noqa: E402
+
+
+def load_cfg(run_dir):
+    """The run's config.yaml with another site's project paths re-rooted on this checkout (siteconf._expand): a run
+    copied site to site (site copy) keeps the paths of the site that trained it (FA-ccin2p3-f5720c93, 2026-11-20)."""
+    import siteconf
+    raw = OmegaConf.to_container(OmegaConf.load(os.path.join(run_dir, "config.yaml")), resolve=False)
+    return OmegaConf.create(siteconf._expand(raw))
+
+
+def _load_best_ckpt(run_dir):
+    p = os.path.join(run_dir, "models", "model_run0_best.pt")
+    if os.path.exists(p):
+        return torch.load(p, map_location="cpu", weights_only=False)
+    with gzip.open(p + ".gz", "rb") as f:
+        return torch.load(io.BytesIO(f.read()), map_location="cpu", weights_only=False)
+
+
+def container_copy(x):
+    """x with every dict, list and plain tuple copied and every other value (tensors, numbers, strings) shared; a dict
+    subclass keeps its type and its attributes (a state dict's _metadata, which load_state_dict reads)"""
+    if isinstance(x, dict):
+        y = type(x)((k, container_copy(v)) for k, v in x.items())
+        if getattr(x, "__dict__", None):
+            y.__dict__.update(container_copy(dict(vars(x))))
+        return y
+    if isinstance(x, list):
+        return [container_copy(v) for v in x]
+    if type(x) is tuple:
+        return tuple(container_copy(v) for v in x)
+    return x
+
+
+def cached_parent_loads(models_dir):
+    """Read each checkpoint under models_dir once per call: base_experiment._torch_load (init_model's fine-tune load)
+    and _load_best_ckpt (load_best_weights) then return a copy of the first read's containers (container_copy), so a
+    probe that edits its state dict (a HETEROSC child's sigma row, assigned as a new tensor) leaves the next probe's
+    unchanged. The tensors are shared, not cloned: their consumers only read them (load_state_dict and the EMA shadow
+    copy_ into the model; _ckpt_scored_state, _merge_lora_state and the sigma row build new tensors), and the deep copy
+    of every tensor, the optimizer state's included, was about 0.1 s of each probe (cProfile FA-ccin2p3-eaf96d1c).
+    Only for a reader that never trains: an EMA built from the shared shadow (base_experiment._load_model_weights'
+    ema.load_state_dict keeps its tensors) would update the cache in place. Any other path loads as before."""
+    models_dir = os.path.realpath(models_dir)
+    cache = {}
+
+    def wrap(load, tag):
+        def f(path, *args, **kw):
+            p = os.path.realpath(str(path)) if tag == "torch_load" else os.path.realpath(os.path.join(str(path), "models"))
+            if not (p == models_dir or p.startswith(models_dir + os.sep)):
+                return load(path, *args, **kw)
+            key = (tag, p, str(kw.get("map_location")))
+            if key not in cache:
+                cache[key] = load(path, *args, **kw)
+            # ZS_PARENT_COPY=deep: the earlier deep copy of every tensor (A/B FA-ccin2p3-30cc8928: the shared copy's
+            # predictions differ from it by less than the deep path's own repeat does, 0.09 s a probe faster)
+            return copy.deepcopy(cache[key]) if os.environ.get("ZS_PARENT_COPY") == "deep" else container_copy(cache[key])
+        return f
+    import base_experiment
+    base_experiment._torch_load = wrap(base_experiment._torch_load, "torch_load")
+    globals()["_load_best_ckpt"] = wrap(_load_best_ckpt, "best_ckpt")
+    return cache
+
+
+def load_best_state(run_dir):
+    """The best checkpoint's "model" entry, plain or gzipped. With EMA on it is the EMA average that validation
+    scored only in a checkpoint written since D63 (marker "model_is_ema"); in an older one it is the LIVE weights at
+    the best step (base_experiment._save_model took state_dict() inside ema.average_parameters() but saved after the
+    context restored the live weights into the same storage; docs/results.tex sec:ema-ckpt). To score a run as it
+    was validated, use load_best_weights."""
+    return _load_best_ckpt(run_dir)["model"]
+
+
+def load_best_weights(model, run_dir):
+    """Load the best checkpoint (es_load_best_model: the validation minimum) into `model` as the run
+    validated it. A checkpoint written since D63 with EMA on ("model_is_ema") holds the EMA weights in "model"; an
+    older one holds the live weights there, and the EMA shadow is applied over model.parameters() (the order
+    ExponentialMovingAverage was built with). Returns True if the weights loaded are the EMA weights."""
+    ck = _load_best_ckpt(run_dir)
+    model.load_state_dict(ck["model"])
+    if ck.get("model_is_ema"):
+        return True
+    ema = ck.get("ema")
+    if not ema:
+        return False
+    params = list(model.parameters())
+    shadow = ema["shadow_params"]
+    assert len(shadow) == len(params), f"{run_dir}: EMA shadow has {len(shadow)} tensors, model {len(params)}"
+    with torch.no_grad():
+        for p, s in zip(params, shadow):
+            assert p.shape == s.shape, f"{run_dir}: EMA shadow shape {tuple(s.shape)} != {tuple(p.shape)}"
+            p.copy_(s.to(p.device, p.dtype))
+    return True
+
+
+def scored_split(exp, split, name):
+    """What a probe read scores on one held-out role of a built experiment: its loader, the pool file the physics
+    check reads and the event indices of that role (for the per-event target factor). split is "val" (the
+    zero-shot reads' default since they began) or "test" (a pool no run selects a checkpoint on: for a process the
+    parent trained on, its val pool was the parent's own checkpoint-selection pool)."""
+    assert split in ("val", "test"), f"split {split!r}: val or test"
+    loader = exp.val_loader if split == "val" else exp.test_loader
+    pool = (getattr(exp, "_pool_paths", None) or {}).get(split, {}).get(name)
+    return loader, pool, exp._split_indices[split]
+
+
+def recipe_role_counts(recipe):
+    """{process: {role: events}} of a recipe file."""
+    r = yaml.safe_load(open(recipe))
+    return {e["name"]: {"train": int(e.get("n_train", 0) or 0), "val": int(e.get("n_val", 0) or 0),
+                        "test": int(e.get("n_test", 0) or 0)} for e in (r.get("processes", r) if isinstance(r, dict) else r)}
+
+
+def stand_in_role(counts, name, role, scored):
+    """(role, events) a probe's `role` is read from: its own when it has events, else the first role it has of the
+    scored split, test, val, train; (role, 0) when it has none."""
+    c = counts.get(name) or {}
+    if c.get(role):
+        return role, c[role]
+    return next(((r, c[r]) for r in [scored] + [x for x in ("test", "val", "train") if x != scored] if c.get(r)),
+                (role, 0))
+
+
+def stand_in_split_set(real, counts, scored):
+    """datagen.ensure_split_set for a probe read: a role a probe has no pool of (an EE4 probe of
+    recipes/catalog_4_ee_test.yaml: n_train 0 and n_val 0, its test pool only) is read from a role it has (stand_in_role).
+    Its train role gives only the probe's own target statistics (fine_tune.target_stats=own), a representation
+    inverted exactly: the truth t = mu_p + sd_p z, the prediction q and mse_logm2_real do not depend on it."""
+    def split(specs, role, seed, dest_dir=None, require_cache=False):
+        out = {}
+        for s in specs:
+            r, n = (role, s["n_events"]) if int(s["n_events"]) > 0 else stand_in_role(counts, s["process"], role, scored)
+            out.update(real([dict(s, n_events=n)], role=r, seed=seed, dest_dir=dest_dir, require_cache=require_cache))
+        return out
+    return split
+
+
+def _build(cfg, swap, path, name):
+    """The experiment built through init_model, with the `swap` role's pool read from `path` (None: none)."""
+    real = datagen.ensure_split_set
+
+    def split(specs, role, seed, dest_dir=None, require_cache=False):     # the loader's own signature
+        return ({name: path} if role == swap else
+                real(specs, role=role, seed=seed, dest_dir=dest_dir, require_cache=require_cache))
+    datagen.ensure_split_set = split
+    try:
+        # the run's own dtype (a training.dtype=float64 run, the KIT benchmark's, is rebuilt in float64)
+        torch.set_default_dtype(torch.float64 if str(cfg.training.get("dtype", "float32")) == "float64"
+                                else torch.float32)
+        from experiment import AmplitudeExperiment
+        exp = AmplitudeExperiment(cfg)
+        exp._init(); exp.init_physics(); exp.init_geometric_algebra()
+        exp.init_data(); exp._init_dataloader(); exp.init_model()
+    finally:
+        datagen.ensure_split_set = real
+    return exp
+
+
+def own_offshell_stats(run_dir):
+    """The off-shellness column stats [mean, std] the run trained with, from a build on its own pools (for runs
+    older than their record in data_stats.json); checked against the run's frozen amplitude stats."""
+    cfg = load_cfg(run_dir)
+    assert cfg.data.get("offshell_per_event", False), f"{run_dir} has no off-shellness input"
+    name = yaml.safe_load(open(os.path.expandvars(str(cfg.data.processes_file))))["processes"][0]["name"]
+    with open_dict(cfg):
+        cfg.train = False; cfg.evaluate = False; cfg.plot = False; cfg.save = False
+        cfg.use_mlflow = False; cfg.count_flops = False
+        cfg.warm_start_idx = None; cfg.fine_tune.pretrained_path = None
+        cfg.run_dir = tempfile.mkdtemp(prefix="rebuild_", dir=os.environ["SCRATCH"])
+        atexit.register(shutil.rmtree, cfg.run_dir, True)  # a scratch run dir: nothing reads it after the process
+    exp = _build(cfg, None, None, name)
+    saved = json.load(open(os.path.join(run_dir, "data_stats.json")))
+    assert np.allclose([float(x) for x in exp.prepd_std], saved["prepd_std"], rtol=1e-6), "not the run's own build"
+    return exp._offshell_stats
+
+
+def _hash_like(x, salt=0):
+    """Noise the shape of x, each component of magnitude in [1, 2] (an eps-scaled vector of it keeps a norm above
+    eps, which lloca's normalisation needs; randn's can fall below it), a fixed function of the component index and
+    `salt` (broadcast against the rows), never of x's bits: a degenerate reference is rounding noise (~1e-122), whose
+    bits move with the batch size and the BLAS threads, so a hash of them was as random as randn_like (package v3 check
+    FA-ccin2p3-21f5d054: tt Born softpair still 0.38 decades subset vs whole file). Stands in for the torch.randn_like
+    draws of lloca's degenerate-frame regularizers, so a frame depends neither on the RNG nor on the batch."""
+    ar = torch.arange(x.shape[-1], device=x.device)
+    h = (ar + 1) * 1442695040888963407 + (torch.as_tensor(salt, device=x.device) + 1) * 7046029254386353131 \
+        + torch.zeros(x.shape[:-1] + (1,), dtype=torch.int64, device=x.device)
+    for k in (33, 29, 32):      # int64 products wrap: a splitmix-style mix of the row's bits
+        h = (h ^ (h >> k)) * -4658895280553007687
+    u = (h & ((1 << 53) - 1)).to(torch.float64) / 2.0 ** 52 - 1.0
+    return (torch.sign(u) + u).to(x.dtype)
+
+
+def deterministic_frame_noise():
+    """lloca's frame regularizers (a lightlike boost vector, coplanar or collinear rotation references) break the
+    degeneracy with eps-sized torch.randn_like noise. In a 2->2 event the learned rotation references can be collinear
+    for every particle (kit tt Born softpair FA-ccin2p3-5515dc85: every event, references ~1e-122), so the frame's
+    orientation is that noise and the prediction followed the global RNG, i.e. the event's place in the scored pool
+    (0.29 decades at the Sudakov strata). For inference, the same regularizers with _hash_like noise (each vector of a
+    stack salted by its index, so two equal vectors still separate)."""
+    import lloca.utils.orthogonalize_3d as o3, lloca.utils.orthogonalize_4d as o4, lloca.utils.polar_decomposition as pd
+    from lloca.utils.lorentz import lorentz_cross, lorentz_squarednorm
+
+    def lightlike(vecs, eps=None):
+        eps = torch.finfo(vecs.dtype).eps if eps is None else eps
+        mask = lorentz_squarednorm(vecs).abs() < eps
+        r = _hash_like(vecs, torch.arange(vecs.shape[-2], device=vecs.device)[:, None] if vecs.dim() > 2 else 0).abs()
+        r = torch.cat([(2 * (r[..., 1:] ** 2).sum(-1, keepdim=True)).sqrt(), r[..., 1:]], -1)   # timelike, as lloca's
+        return vecs + mask.unsqueeze(-1) * eps * r, mask.any(dim=-1).sum() if vecs.dim() > 2 else mask.sum()
+
+    def coplanar(vecs, eps=None):
+        eps = torch.finfo(vecs.dtype).eps if eps is None else eps
+        mask = lorentz_squarednorm(lorentz_cross(*vecs.unbind(dim=-2))).abs() < eps
+        r = _hash_like(vecs, torch.arange(vecs.shape[-2], device=vecs.device)[:, None])
+        return vecs + mask[..., None, None] * eps * r, mask.sum()
+
+    def collinear(vecs, eps=None):
+        eps = torch.finfo(vecs.dtype).eps if eps is None else eps
+        v0, v1 = vecs.unbind(dim=-2)
+        mask = (torch.cross(v0, v1, dim=-1) ** 2).sum(dim=-1) < eps
+        out = [torch.where(mask[..., None], v + eps * _hash_like(v, k + 1), v) for k, v in enumerate((v0, v1))]
+        return torch.stack(out, dim=-2), mask.sum()
+    o4.regularize_lightlike = pd.regularize_lightlike = lightlike
+    o4.regularize_coplanar, o3.regularize_collinear = coplanar, collinear
+
+
+def rebuild(run_dir, role, path, n_events, event_frame=False):
+    """(exp, loader): the run rebuilt with `role` ('val' or 'test') read from `path` (n_events rows),
+    in eval mode with its best weights; loader iterates that role in the order of exp._role_perm[role].
+    event_frame: that role unaugmented (data.unaugmented_roles), each event read in its own centre-of-mass frame, so
+    its prediction depends on the event alone, not on the pool (the augmentation is keyed on the pool's identity), and
+    the frames' degeneracy noise a function of each particle (deterministic_frame_noise).
+    REBUILD_SET (env, comma-separated key=value): config keys set on the rebuilt run, e.g. an input map switched on at
+    evaluation (selective_rescale D561: model.input_soft_eps=1e-8,model.input_soft_x0=0.009)."""
+    cfg = load_cfg(run_dir)
+    if os.environ.get("REBUILD_SET"):
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(os.environ["REBUILD_SET"].split(",")))
+    own_recipe = os.path.expandvars(str(cfg.data.processes_file))
+    rec = yaml.safe_load(open(own_recipe))
+    (spec,) = rec["processes"]
+    name = spec["name"]
+    spec[f"n_{role}"] = int(n_events)
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+    yaml.safe_dump(rec, tmp); tmp.close()
+    with open_dict(cfg):
+        cfg.train = False; cfg.evaluate = False; cfg.plot = False; cfg.save = False
+        cfg.use_mlflow = False; cfg.count_flops = False
+        cfg.warm_start_idx = None; cfg.fine_tune.pretrained_path = None
+        cfg.data.processes_file = tmp.name
+        cfg.data.eval_subsample = None            # the swapped split is read whole (the recipe count caps it)
+        if event_frame:
+            assert not cfg.data.get("memmap", False), "event_frame is wired on the in-memory data path only"
+            cfg.data.unaugmented_roles = [role]
+            deterministic_frame_noise()
+        cfg.run_dir = tempfile.mkdtemp(prefix="rebuild_", dir=os.environ["SCRATCH"])
+        atexit.register(shutil.rmtree, cfg.run_dir, True)  # a scratch run dir: nothing reads it after the process
+    if OmegaConf.select(load_cfg(run_dir), "fine_tune.pretrained_path"):
+        # a fine-tuned run trained on frozen stats (its parent's, kept in its own data_stats.json), not on stats of
+        # its own train split (protocol B adds hard events, which moves mom_div): the experiment reads frozen stats
+        # from <pretrained_path>/../../data_stats.json, so point it at this run's own best model
+        own = os.path.join(run_dir, "models", "model_run0_best.pt")
+        with open_dict(cfg):
+            cfg.fine_tune.pretrained_path = own if os.path.exists(own) else own + ".gz"
+    saved = json.load(open(os.path.join(run_dir, "data_stats.json")))
+    if cfg.data.get("offshell_per_event", False) and cfg.data.get("offshell_stats", None) is None:
+        # the off-shellness column stats are fitted on every role together (experiment.py), so the swapped
+        # split would move them and shift every event's input; pin the run's own. Runs older than the
+        # record in data_stats.json get them from a build on the run's own pools
+        own = saved.get("offshell_stats")
+        if own is None:
+            own = own_offshell_stats(run_dir)
+        with open_dict(cfg):
+            cfg.data.offshell_stats = own
+    exp = _build(cfg, role, path, name)
+    got = dict(mom_div=float(exp.mom_div), prepd_mean=[float(x) for x in exp.prepd_mean],
+               prepd_std=[float(x) for x in exp.prepd_std])
+    for k, v in got.items():
+        assert np.allclose(v, saved[k], rtol=1e-6), f"rebuilt {k} {v} != the run's {saved[k]}"
+    if saved.get("tchannel_norm") is not None:
+        assert np.allclose(exp._tch_norm, saved["tchannel_norm"], rtol=1e-6), (exp._tch_norm, saved["tchannel_norm"])
+    load_best_weights(exp.model, run_dir)
+    exp.model.to(exp.device, dtype=exp.dtype).eval()
+    if os.environ.get("REBUILD_SET"):   # proof the set keys reached the rebuilt model
+        print("REBUILD_SET_MODEL " + json.dumps({k: getattr(exp.model, k, None) for k in
+                                                 ("input_soft_eps", "input_soft_x0", "input_soft_gate",
+                                                  "input_soft_skip_neutrinos")}), flush=True)
+    loader = exp.val_loader if role == "val" else exp.test_loader
+    n = len(loader.dataset) if hasattr(loader.dataset, "__len__") else None
+    assert n in (None, int(n_events)), f"{role} loader holds {n} events, expected {n_events}"
+    return exp, loader

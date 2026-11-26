@@ -1,0 +1,5049 @@
+import math
+
+import numpy as np
+import torch
+
+import contextlib
+import os
+import json
+import time
+from omegaconf import OmegaConf, open_dict
+
+from base_experiment import BaseExperiment
+from dataset import AmplitudeDataset
+from preprocessing import (
+    preprocess_particles,
+    preprocess_amplitude,
+    undo_preprocess_amplitude,
+    resolve_amp_trafos,
+    SIGNEDLOG_QUANTILE,
+)
+from plots import plot_mixer, short_ds_name
+from logger import LOGGER
+#from mlflow_util import log_mlflow
+from losses import LogCoshLoss, RelL1Loss, HeteroscedasticLoss
+from dataset import AmplitudeDataset, collate_variable_length
+from multiplicity_extrap import order_identical_particles, fit_affine_multiplicity, parent_target_standardization
+
+from lloca.utils.rand_transforms import rand_lorentz
+from lloca.utils.polar_decomposition import restframe_boost
+import keyed_aug
+from keyed_aug import pool_identity
+
+import psutil, os
+
+
+# TYPE_TOKEN_DICT — LEGACY, non-LLoCa path only (MLP / plain transformer). It is referenced in
+# init_physics but its definition was dropped in the LLoCa refactor, so `model=mup_mlp` has been
+# dead code (NameError). Restored purely to run the DIAGNOSTIC CONTROL: the reference
+# implementation (heidelberg-hepml/amplitude_DSI) wires HETEROSC ONLY into the MLP, never into
+# LLoCa, so the MLP is the one architecture on which the het loss is actually validated.
+#
+# Values are the per-particle type tokens used to expose permutation symmetry (identical
+# particles share a token). We only ever run this control with data.include_permsym=false, where
+# the caller takes list(range(len(...))) — i.e. only the LENGTH (= n_particles) is used, and each
+# particle stays distinct. That avoids asserting a symmetry that does not hold (u and ubar are
+# NOT identical particles, so they must not share a token).
+TYPE_TOKEN_DICT = {
+    # e+ e- -> u ubar g   : 5 particles
+    "ee_uug_91-1000GeV_amplitudes":  [0, 1, 2, 3, 4],
+    # e+ e- -> u ubar g g : 6 particles
+    "ee_uugg_91-1000GeV_amplitudes": [0, 1, 2, 3, 4, 5],
+    # e+ e- -> u ubar     : 4 particles
+    "ee_uu_91-1000GeV_amplitudes":   [0, 1, 2, 3],
+}
+
+# Coupling-order vector of a dataset's stored target (mg5_pipeline_final.order_vector):
+#   [L_QCD, L_EW, alpha_s_power_max, alpha_ew_power_max]
+# e.g. e+e- > u u~ LO = [0,0,0,2], + g = [0,0,1,2], u u~ > g g = [0,0,2,0], the mixed
+# four-quark entries [0,0,2,2], the stripped QCD-virt of e+e- > u u~ = [1,0,0,2].
+# Legacy 2-vectors [n_loops, alpha_s_power] in old recipes/configs are widened by
+# mg.normalize_order_vector. Name-keyed fallback for the files data path: the catalog
+# entry whose key prefixes the dataset name; else the old token map (EW power unknown).
+_AMP_ORDER_BY_NAME = [
+    ("nnlo",     [2, 0, 2, 0]),
+    ("nlo_full", [1, 0, 1, 0]),   # legacy name token only: no pointwise "full NLO" target exists
+    ("nlo_virt", [1, 0, 0, 0]),   # absolute-virt (e4) and the virt/born ratio
+]
+
+def pair_beta(particles, pdg_ids, pdg=6):
+    """Velocity of the pdg / anti-pdg pair in its rest frame, lambda^(1/2)(s, m1^2, m2^2) / s (sqrt(1 - 4 m^2 / s) for
+    equal masses), per event; particles (N, 4n) flat four-momenta, pdg_ids (N, n). data.target_times_beta's factor."""
+    p = np.asarray(particles, np.float64).reshape(len(particles), -1, 4)
+    has = [(pdg_ids == q) for q in (pdg, -pdg)]
+    assert all(h.any(1).all() for h in has), f"an event without its {pdg} / {-pdg} pair"
+    r = np.arange(len(p))
+    a, b = p[r, has[0].argmax(1)], p[r, has[1].argmax(1)]
+    m2 = lambda q: q[:, 0] ** 2 - (q[:, 1:] ** 2).sum(1)
+    s, ma, mb = m2(a + b), m2(a), m2(b)
+    beta = np.sqrt(np.clip((s - ma - mb) ** 2 - 4 * ma * mb, 0, None)) / s
+    assert (beta > 0).all(), "a pair at threshold (beta = 0): the target times beta would vanish"
+    return beta
+
+
+def _reg_params(model):
+    """The parameters under the L2/L1 penalty: all of them except a Bayesian readout's log-variances
+    (models/bayesian_readout.py), whose prior is the KL term (_reg_term). Same tensors, same order as
+    model.parameters() when there is none."""
+    return [p for n, p in model.named_parameters() if not n.endswith("logsig2_w")]
+
+
+def catalog_cfg_for_dataset(name):
+    """The catalog entry whose key prefixes a (files-path) dataset name, else None."""
+    import mg5_pipeline_final as mg   # lazy: keeps the MG5 catalog off the import path
+    low = str(name).lower()
+    keys = sorted((k for k in mg.PROCESSES if low.startswith(k.lower() + "_") or low == k.lower()),
+                  key=len, reverse=True)
+    return mg.PROCESSES[keys[0]] if keys and "nfinal" in mg.PROCESSES[keys[0]] else None
+
+
+def recipe_process_cfg(spec):
+    """The PROCESSES entry a recipe spec's pool was generated from (its own name once register_recipe_processes has
+    registered a physics scan, else its base), for the encoding's species (particle_ids.species_pdgs); None if unknown."""
+    import mg5_pipeline_final as mg
+    return mg.PROCESSES.get(spec["name"]) or mg.PROCESSES.get(spec.get("base", spec["name"]))
+
+
+def amp_order_for_dataset(name):
+    """Map a dataset name to its coupling-order vector (see above)."""
+    import mg5_pipeline_final as mg
+    cfg = catalog_cfg_for_dataset(name)
+    if cfg is not None:
+        return mg.order_vector(cfg)
+    low = str(name).lower()
+    for token, order in _AMP_ORDER_BY_NAME:
+        if token in low:
+            return list(order)
+    return [0, 0, 0, 0]
+
+def log_memory_usage(tag=""):
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    LOGGER.info(
+        f"[{tag}] RSS={mem_info.rss/1e9:.2f} GB, VMS={mem_info.vms/1e9:.2f} GB, "
+        f"System available={psutil.virtual_memory().available/1e9:.2f} GB"
+    )
+
+def log_gpu_memory(tag=""):
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1e9
+        reserved = torch.cuda.memory_reserved() / 1e9
+        LOGGER.info(f"[{tag}] GPU allocated={allocated:.2f} GB, reserved={reserved:.2f} GB")
+
+
+DATASET_TITLE_DICT = {
+    "qqbar_Zg_13000GeV_amplitudes": r"$q\bar q\to Zg$",
+    "ee_uu__pp_Zj": r"$e^+e^-\to u\bar u$ and $pp\to Zj$",
+    "aag": r"$gg\to\gamma\gamma g$",
+    "aag_cleaned": r"$gg\to\gamma\gamma g$",
+    "aag_inv": r"$gg\to\gamma\gamma g$",
+    "aag_inv_naiv": r"$gg\to\gamma\gamma g$",
+    "aag_inv_all": r"$gg\to\gamma\gamma g$",
+    "aagg": r"$gg\to\gamma\gamma gg$",
+    "aagg_cleaned": r"$gg\to\gamma\gamma gg$",
+    "zg": r"$q\bar q\to Zg$",
+    "zg_cleaned": r"$q\bar q\to Zg$",
+    "zgg": r"$q\bar q\to Zgg$",
+    "zgg_cleaned": r"$q\bar q\to Zgg$",
+    "zgg_inv": r"$q\bar q\to Zgg$",
+    "zgg_pinv": r"$q\bar q\to Zgg$",
+    "zggg": r"$q\bar q\to Zggg$",
+    "zggg_cleaned": r"$q\bar q\to Zggg$",
+    "zgggg": r"$q\bar q\to Zgggg$",
+    "zgggg_cleaned": r"$q\bar q\to Zgggg$",
+    "zgggg_10M": r"$q\bar q\to Zgggg$",
+    "zgggg_sorted": r"$q\bar q\to Zgggg$",
+    "zggggg": r"$q\bar q \to Zggggg$",
+    "wz": r"$q\bar q \to WZ$",
+    "wz_cleaned": r"$q\bar q \to WZ$",
+    "wzg": r"$q\bar q \to WZg$",
+    "wzg_cleaned": r"$q\bar q \to WZg$",
+    "wzgg": r"$q\bar q \to WZgg$",
+    "wzgg_cleaned": r"$q\bar q \to WZgg$",
+    "wwz": r"$q\bar q \to WWZ$",
+    "wwz_cleaned": r"$q\bar q \to WWZ$",
+    "qq_tth": r"$q\bar q \to ttH$",
+    "qq_tth_16M": r"$q\bar q \to ttH$",
+    "qq_tth_loop": r"$q\bar q \to ttH$ (Loop)",
+    "gg_tth": r"$gg \to ttH$",
+    "gg_tth_loop": r"$gg \to ttH$ (Loop)",
+    "gggh": r"$gg \to Hg$",
+    "qq_tth_uw": r"$q\bar q \to ttH$",
+    "qq_tth_loop_uw": r"$q\bar q \to ttH$ (Loop)",
+    "gg_tth_uw": r"$gg \to ttH$",
+    "gg_tth_loop_uw": r"$gg \to ttH$ (Loop)",
+    "gggh_uw": r"$gg \to Hg$",
+}
+MODEL_TITLE_DICT = {
+    "Transformer": "Tr",
+    "MLP": "MLP",
+    "MuMLP": "μP MLP",
+    "FV_MLP": "FV MLP",
+    "DSI": "DSI",
+    "LGATr": "LGATr",
+    "LLOCATransformer": "LLoCa Transformer",
+    "LLOCAMuPTransformer": "LLoCa muP Transformer",
+    "MuPLGATr": "L-GATr muP",
+    "MuPLGATrSlim": "L-GATr-slim muP"
+}
+
+
+class AmplitudeExperiment(BaseExperiment):
+    def init_physics(self):
+        assert not self.cfg.training.force_xformers
+
+        # Recipe-based data path: derive the dataset name list / amp_orders from
+        # the `data.processes` spec before anything reads cfg.data.dataset.
+        if self.cfg.data.get("source", "files") == "recipes":
+            self._resolve_recipe_config()
+
+        self.n_datasets = len(self.cfg.data.dataset)
+        # particles per event of each process (initial + final), filled by the data path;
+        # the excess aggregation keys its per-multiplicity reference on it
+        self._proc_npart = np.zeros(self.n_datasets, dtype=np.int64)
+
+        self.modelname = self.cfg.model.net._target_.rsplit(".", 1)[-1]
+
+        if self.modelname in ["GAP", "MLP", "DSI"]:
+            assert len(self.cfg.data.dataset) == 1, (
+                f"Architecture {self.modelname} cannot handle several datasets"
+            )
+
+        # initialise tokenizer — will be populated in init_data
+        from particle_ids import ParticleTokenizer
+        tokenizer_path = os.path.join(self.cfg.run_dir, "particle_tokenizer.json")
+        ft = self.cfg.get("fine_tune", None)
+        ft_path = ft.get("pretrained_path", None) if ft is not None else None
+        if self.warm_start and os.path.exists(tokenizer_path):
+            self.tokenizer = ParticleTokenizer.load(tokenizer_path)
+            LOGGER.info(f"Loaded tokenizer with vocab_size={self.tokenizer.vocab_size}")
+        elif ft_path is not None:
+            # Load tokenizer from pretrained model's run directory (two levels up from .pt)
+            pretrained_run_dir = os.path.dirname(os.path.dirname(ft_path))
+            pretrained_tok_path = os.path.join(pretrained_run_dir, "particle_tokenizer.json")
+            if os.path.exists(pretrained_tok_path):
+                self.tokenizer = ParticleTokenizer.load(pretrained_tok_path)
+                self._parent_vocab_size = self.tokenizer.vocab_size
+                LOGGER.info(
+                    f"Fine-tuning: loaded tokenizer from pretrained run at {pretrained_tok_path} "
+                    f"(vocab_size={self.tokenizer.vocab_size})"
+                )
+            else:
+                LOGGER.warning(
+                    f"Fine-tuning: no tokenizer found at {pretrained_tok_path}, using fresh tokenizer"
+                )
+                self.tokenizer = ParticleTokenizer()
+        else:
+            self.tokenizer = ParticleTokenizer()
+
+        # mom_mean and mom_std are per-dataset, populated in init_data
+        self.mom_mean = []
+        self.mom_std  = []
+        # Global physical momentum scale (recipe path: one train-fit std applied to
+        # every process). The model sees momenta divided by it; needed to recover
+        # physical GeV for data.mass_from_momenta. None until set in init_data.
+        self.mom_div  = None
+
+        if self.modelname not in ("LLOCATransformer", "LLOCAMuPTransformer", "MuPLGATr", "MuPLGATrSlim"):
+            self.type_token = []
+            for dataset in self.cfg.data.dataset:
+                if self.cfg.data.include_permsym:
+                    self.type_token.append(TYPE_TOKEN_DICT[dataset])
+                else:
+                    self.type_token.append(list(range(len(TYPE_TOKEN_DICT[dataset]))))
+        
+    def _resolve_recipe_config(self):
+        """Parse the `data.processes` recipe spec into the per-process spec list
+        and populate the config keys the rest of the pipeline expects
+        (`data.dataset`, `data.amp_orders`). Runs once, at the top of
+        init_physics, before n_datasets is read."""
+        import mg5_pipeline_final as mg
+
+        procs = self.cfg.data.get("processes", None)
+        # Fall back to an external spec file (data.processes_file) — easier to
+        # thread through a sweep than a nested list-of-dicts CLI override. The
+        # file is a YAML/JSON list of the same per-process dicts.
+        if not procs:
+            pf = self.cfg.data.get("processes_file", None)
+            if pf:
+                import yaml
+                with open(pf) as f:
+                    procs = yaml.safe_load(f)
+                # Allow either a bare list or {processes: [...]}.
+                if isinstance(procs, dict):
+                    self._recipe_default_sampling = procs.get("sampling") if isinstance(procs, dict) else None
+                    procs = procs.get("processes", procs)
+                LOGGER.info(f"Loaded {len(procs)} recipe processes from {pf}")
+        assert procs, ("data.source=recipes requires data.processes or "
+                       "data.processes_file to be set")
+
+        specs, names, amp_orders = [], [], []
+        couplings_by_pid = []   # per-dataset {order_key: alpha} or None (vertex + scalar features)
+        internal_mass_by_pid = []   # per-dataset [mass for pdg in internal_mass_pdgs] (log-fed scalar)
+        # Read straight from cfg (this runs in init_physics, before init_data sets the
+        # attribute) so the extraction below is always populated, like couplings.
+        self._internal_mass_pdgs = [int(p) for p in (self.cfg.data.get("internal_mass_pdgs", []) or [])]
+        base_by_name = {}       # decorated dataset name → underlying mg5/sidecar process
+        for p in procs:
+            p = OmegaConf.to_container(p, resolve=True) if OmegaConf.is_config(p) else dict(p)
+            name = p["name"]
+            # ``base`` is the underlying mg5 PROCESSES key / diagram-sidecar name.
+            # It defaults to ``name`` but lets a coupling/mass SCAN give each variant
+            # a distinct dataset name (e.g. ee_uug__as0.13) that still resolves to the
+            # one ee_uug process for generation and the diagram graph.
+            base = p.get("base", name)
+            base_by_name[name] = base
+            sqrts = p["sqrts"]
+            # Single physics block (alpha_s / alpha_ew / masses) is the source of
+            # truth: the generator derives param_card_patches + m_finals from it
+            # (register_recipe_processes below), and the model's coupling feature is
+            # derived from the SAME block — so the two cannot drift. Masses reach the
+            # model via the generated momenta (data.mass_from_momenta), not here.
+            physics = p.get("physics", None)
+            physics = OmegaConf.to_container(physics, resolve=True) if OmegaConf.is_config(physics) else (dict(physics) if physics else None)
+            specs.append({
+                "name":      name,
+                "base":      base,
+                "sqrts_min": float(sqrts[0]),
+                "sqrts_max": float(sqrts[1]),
+                "n_train":   int(p["n_train"]),
+                "n_val":     int(p["n_val"]),
+                "n_test":    int(p["n_test"]),
+                "physics":   physics,
+                "sampling":  p.get("sampling", None),
+                "sqrts_measure": p.get("sqrts_measure", None),     # an entry's own measure (log_beta: kit threshold pools)
+                "store_tag": p.get("store_tag", None),     # the pool's own file name (mg.register_recipe_processes)
+                # monitor process (scored at validation, never trained on; see _monitor_names below)
+                "monitor":   bool(p.get("monitor", False)),
+                # a monitor's train events used in training (default 0): a replay buffer of the old processes, drawn
+                # from the pool the statistics are still fitted on (the add-W partial replay, D31)
+                "train_events": int(p.get("train_events", 0) or 0),
+            })
+            names.append(name)
+            # Coupling-order vector: resolved AFTER register_recipe_processes below, so a
+            # decorated scan name (alphas_prefactor restored, patched masses) is looked
+            # up as itself. An explicit amp_orders on the spec wins (2-vectors widened).
+            amp_orders.append(p.get("amp_orders", None))
+            # Per-dataset coupling VALUES {order_key: alpha} for the vertex features
+            # and the global scalar fallback. Derived from the physics block; an
+            # explicit `couplings` on the spec still wins (manual override).
+            cpl = p.get("couplings", None)
+            if cpl is None and physics is not None:
+                cpl = mg.physics_to_couplings(physics)
+            couplings_by_pid.append({str(k): float(v) for k, v in cpl.items()} if cpl else None)
+            # Per-dataset INTERNAL (propagator/resonance) mass values for the
+            # internal_mass_scalars feature: the scanned mass of a mediator that is
+            # NOT an external leg. Falls back to the process's own internal mass (a
+            # synthetic process's random scalar mass), else the table mass, when unscanned.
+            masses_blk = (physics or {}).get("masses", {}) if physics else {}
+            imrow = []
+            for pdg in getattr(self, "_internal_mass_pdgs", []):
+                v = masses_blk.get(pdg, masses_blk.get(str(pdg)))
+                imrow.append(float(v) if v is not None else mg.internal_mass(base, pdg))
+            internal_mass_by_pid.append(imrow)
+
+        # Register any physics-scan / decorated-base datasets into mg.PROCESSES so
+        # generation (inline or prebuild) can address them by dataset name.
+        mg.register_recipe_processes(specs, default_sampling=getattr(self, "_recipe_default_sampling", None))
+        for i, (name, spec) in enumerate(zip(names, specs)):
+            ocfg = mg.PROCESSES[name] if name in mg.PROCESSES else mg.PROCESSES[spec["base"]]
+            amp_orders[i] = (mg.normalize_order_vector(amp_orders[i], ocfg) if amp_orders[i] is not None
+                             else mg.order_vector(ocfg))
+
+        self._recipe_specs       = specs
+        # monitor processes (a recipe entry's `monitor: true`): loaded, standardized on their own train pool and scored
+        # at every validation like any other, but never trained on and outside the validation aggregate that selects
+        # the checkpoint; a second aggregate over every process (val_loss_no_reg_all) selects model_run*_best_all.pt.
+        # Built to watch forgetting while a model is fine-tuned on new processes (docs/results.tex, the add-W step)
+        self._monitor_names      = [s["name"] for s in specs if s.get("monitor", False)]
+        self._monitor_pids       = [i for i, s in enumerate(specs) if s.get("monitor", False)]
+        assert len(self._monitor_pids) < len(specs), "every process of the recipe is a monitor: nothing to train on"
+        _bad = [s["name"] for s in specs if s.get("train_events", 0) and not s.get("monitor", False)]
+        assert not _bad, f"train_events is a monitor's replay buffer; set on non-monitor processes {_bad}"
+        self._coupling_by_pid    = couplings_by_pid
+        self._internal_mass_by_proc = internal_mass_by_pid
+        # Standardize log-mass per PDG across the run's datasets so the fed scalar is
+        # O(1). Mass varies little in relative terms (log M_Z spans ~0.13 over an
+        # 85->97 scan), so a raw/centered log is a near-constant the net ignores;
+        # unit-std matches the coupling's naturally-O(1) log(alpha). (Test-time
+        # choice: for production one would freeze these stats like amp standardization.)
+        self._internal_mass_feat = None
+        pdgs = getattr(self, "_internal_mass_pdgs", [])
+        if pdgs and internal_mass_by_pid:
+            arr  = np.array(internal_mass_by_pid, dtype=np.float64)      # (n_ds, n_pdg)
+            logm = np.log(np.clip(arr, 1e-9, None))
+            mu, sd = logm.mean(0), logm.std(0)
+            sd[sd < 1e-8] = 1.0
+            self._internal_mass_feat = ((logm - mu) / sd).astype(np.float32)
+        self._recipe_base_by_name = base_by_name
+        amp_orders = self._orders_from_diagrams(names, amp_orders)
+        with open_dict(self.cfg):
+            self.cfg.data.dataset    = names
+            self.cfg.data.amp_orders = amp_orders
+        n_cpl = sum(c is not None for c in couplings_by_pid)
+        LOGGER.info(
+            f"Recipe data source: {len(names)} processes {names} "
+            f"(seed={self.cfg.data.get('seed', 42)}; couplings on {n_cpl}/{len(names)} datasets)"
+        )
+
+    def _boost_com(self, particles, n_particles):
+        """A raw momentum block boosted to the centre-of-mass frame of its two incoming momenta (energies put on
+        shell from the stored masses first), (N, n_particles, 4) float32: the momenta every frame-independent
+        quantity (s_hat, the off-shellness, the target factors) is computed from, and what the augmentation
+        (_augment) transforms. The boost math in float64."""
+        particles_t = torch.tensor(particles, dtype=torch.float64)
+        particles_t = particles_t.reshape(-1, n_particles, 4)
+        m2 = particles_t[..., 0] ** 2 - (particles_t[..., 1:] ** 2).sum(dim=-1)
+        particles_t[..., 0] = torch.sqrt(
+            (particles_t[..., 1:] ** 2).sum(dim=-1) + m2.clamp(min=0)
+        )
+        to_com = restframe_boost(particles_t[..., :2, :].sum(dim=-2))
+        particles_t = torch.einsum("...ij,...kj->...ki", to_com, particles_t)
+        return particles_t.numpy().astype(AmplitudeExperiment._mom_np_dtype(self))
+
+    def _mom_np_dtype(self):
+        """The numpy dtype of the momenta the network reads: float64 for a training.dtype=float64 run (the KIT
+        hard phase-space benchmark: at y ~ 1e-7 or beta ~ 1e-4 float32 cannot resolve the singular invariants),
+        float32 otherwise"""
+        tr = self.cfg.get("training", None) or {}
+        return np.float64 if str(tr.get("dtype", "float32")) == "float64" else np.float32
+
+    def _aug_seed(self):
+        """The seed of the per-event augmentation draws (keyed_aug): the run's seed, or when the run has none the
+        torch RNG's initial seed (random per process, as the unseeded draws were)"""
+        return int(self.cfg.seed) if self.cfg.get("seed", None) is not None else int(torch.initial_seed())
+
+    def _model_momenta(self, rec, mom_div=None):
+        """A store record's momenta as the network reads them, in chunks: its centre-of-mass momenta augmented
+        (keyed_aug, per event), per sqrt(s_hat) under dimensionless_inputs, / mom_div when given"""
+        # data.unaugmented_roles (tools/rebuild_run.py, inference): the role is read as given, so an event's
+        # prediction does not depend on the pool it is in (the augmentation is keyed on the pool's identity)
+        uid = None if rec.get("role") in (self.cfg.data.get("unaugmented_roles", None) or ()) else rec["uid"]
+        return keyed_aug.model_momenta_chunks(rec["com"], self._aug_seed(), uid, rs=rec.get("rs"),
+                                              mom_div=mom_div, dtype=self._mom_np_dtype())
+
+    def _resolve_amp_orders(self, names):
+        """Per-dataset coupling-order vector (see _AMP_ORDER_BY_NAME). An explicit, length-matched
+        data.amp_orders wins (e.g. the recipe path sets it per process); otherwise
+        derive from dataset names so NLO/NNLO targets are labelled correctly instead
+        of silently inheriting the positional LO default."""
+        import mg5_pipeline_final as mg
+        cfg_orders = self.cfg.data.get("amp_orders", None)
+        if cfg_orders is not None and len(cfg_orders) == len(names):
+            # a legacy 2-vector takes its EW power from the catalog entry of the dataset,
+            # so an explicit config and the recipe path label the same .npy identically
+            out = self._orders_from_diagrams(
+                names, [mg.normalize_order_vector(o, catalog_cfg_for_dataset(n)) for o, n in zip(cfg_orders, names)])
+            with open_dict(self.cfg):
+                self.cfg.data.amp_orders = out
+            return out
+        derived = self._orders_from_diagrams(names, [amp_order_for_dataset(n) for n in names])
+        if cfg_orders is not None:
+            LOGGER.warning(
+                f"data.amp_orders has {len(cfg_orders)} entries but {len(names)} "
+                f"dataset(s); deriving from names instead: {list(zip(names, derived))}")
+        else:
+            LOGGER.info(f"Derived amp_orders from dataset names: {list(zip(names, derived))}")
+        with open_dict(self.cfg):
+            self.cfg.data.amp_orders = derived
+        return derived
+
+    # Fixed key order for the global per-event coupling scalar (data.coupling_scalars).
+    # Matches diagram_graphs.DEFAULT_ORDER_KEYS so the vertex feature and the global
+    # fallback speak the same coupling vocabulary (QED ↔ EW, QCD ↔ strong).
+    COUPLING_SCALAR_KEYS = ("QED", "QCD")
+
+    def _coupling_scalar_row(self, proc_idx):
+        """Per-event log-coupling vector log(alpha_key) for COUPLING_SCALAR_KEYS,
+        broadcast like amp_orders (constant within a dataset). Keys absent from the
+        dataset's coupling dict (coupling doesn't enter the process) → 0 = log(1).
+        Returns a length-0 array when data.coupling_scalars is off."""
+        if not getattr(self, "_use_coupling_scalars", False):
+            return np.zeros((0,), dtype=np.float32)
+        cpl = (getattr(self, "_coupling_by_pid", None) or [None] * (proc_idx + 1))[proc_idx]
+        cpl = cpl or {}
+        return np.array(
+            [np.log(cpl[k]) if (k in cpl and cpl[k] > 0) else 0.0
+             for k in self.COUPLING_SCALAR_KEYS], dtype=np.float32)
+
+    def _internal_mass_row(self, proc_idx):
+        """Per-event log-mass vector for the configured INTERNAL (propagator/
+        resonance) PDGs — a mass that is NOT an external leg, so it is absent from
+        the momenta and mass_from_momenta cannot recover it (the internal-mass analog
+        of _coupling_scalar_row). Constant within a dataset; length = len(pdgs) when
+        on (0-padded for datasets that don't scan it), length 0 when off."""
+        pdgs = getattr(self, "_internal_mass_pdgs", []) or []
+        if not getattr(self, "_use_internal_mass_scalars", False) or not pdgs:
+            return np.zeros((0,), dtype=np.float32)
+        # Standardized (unit-std across the run's datasets) log-mass — see
+        # _internal_mass_feat: mass varies little in relative terms, so a raw log
+        # would be a near-constant the net ignores; standardizing makes it O(1)
+        # like the coupling's naturally-O(1) log(alpha).
+        feat = getattr(self, "_internal_mass_feat", None)
+        if feat is None or proc_idx >= len(feat):
+            return np.zeros((len(pdgs),), dtype=np.float32)
+        return np.asarray(feat[proc_idx], dtype=np.float32).copy()
+
+    def _order_row(self, proc_idx, amp_orders):
+        """Per-event scalar vector fed as order_labels: the amp_orders powers
+        [n_loops, alpha_s_power] optionally extended with the global coupling
+        scalars (data.coupling_scalars) and internal-mass scalars
+        (data.internal_mass_scalars). Shared by both data paths so
+        n_order_features is identical."""
+        base = np.array(amp_orders[proc_idx], dtype=np.float32)
+        if bool(self.cfg.data.get("drop_coupling_powers", False)):
+            # the coupling powers [.., alpha_s_max, alpha_ew_max] grow with the legs (alpha_s_max = n for W/Z + n g):
+            # broadcast to every particle they hand the multiplicity to particle 1, against the causal mask's
+            # log A_i(p_1..p_i) (D55). Zeroed, not removed, so the feature width and checkpoints stay; the loop
+            # counts (tree against one-loop of the same particles) are kept.
+            assert base.shape[0] == 4, f"amp_orders {base} is not [L_QCD, L_EW, alpha_s_max, alpha_ew_max]"
+            base[2:] = 0.0
+        return np.concatenate([base, self._coupling_scalar_row(proc_idx),
+                               self._internal_mass_row(proc_idx)])
+
+    def init_data(self):
+        self._use_coupling_scalars = bool(self.cfg.data.get("coupling_scalars", False))
+        self._use_internal_mass_scalars = bool(self.cfg.data.get("internal_mass_scalars", False))
+        self._internal_mass_pdgs = [int(p) for p in (self.cfg.data.get("internal_mass_pdgs", []) or [])]
+        self._resonance_per_event = bool(self.cfg.data.get("resonance_per_event", False))
+        self._offshell_per_event = bool(self.cfg.data.get("offshell_per_event", False))
+        assert not (bool(self.cfg.data.get("alphas_input", False)) and not bool(self.cfg.data.get("memmap", False))), \
+            "data.alphas_input is built on the memmap path (data.memmap=true)"
+        # D506: a new training run with off-shellness carries the W; a fine-tune or warm start keeps its parent's columns
+        ft = self.cfg.get("fine_tune", None) or {}
+        assert not (self._offshell_per_event and self._use_internal_mass_scalars and self.cfg.get("train", True)
+                    and not ft.get("pretrained_path", None) and self.cfg.get("warm_start_idx", None) is None
+                    and 24 not in self._internal_mass_pdgs), \
+            f"data.internal_mass_pdgs {self._internal_mass_pdgs} lacks the W (24): D506, the default is [23, 6, 25, 24]"
+        if bool(self.cfg.data.get("dimensionless_inputs", False)):
+            # the settings that would still feed GeV, or rebuild GeV from the momenta, under dimensionless_inputs
+            assert self.cfg.data.get("source", "files") == "recipes", "data.dimensionless_inputs: the recipe path only"
+            assert not self._resonance_per_event, "data.dimensionless_inputs: resonance_per_event feeds sqrt(s) - m in GeV"
+            assert not (self._use_internal_mass_scalars and not self._offshell_per_event), \
+                "data.dimensionless_inputs: internal_mass_scalars without offshell_per_event feeds the masses in GeV"
+            assert not bool(self.cfg.model.get("use_pair_bias", False)), \
+                "data.dimensionless_inputs: use_pair_bias rebuilds s - m^2 in GeV from the momenta"
+            assert not (bool(self.cfg.model.get("use_diagrams", False))
+                        and str(self.cfg.model.get("diagram_encoder_impl", "ours")) != "llm4lhc"), \
+                "data.dimensionless_inputs: the 'ours' diagram encoder feeds each propagator's log10 mass in GeV"
+            assert not bool(self.cfg.model.get("use_diagram_virtuality", False)), \
+                "data.dimensionless_inputs: use_diagram_virtuality rebuilds the virtualities in GeV from the momenta"
+        if self.cfg.data.get("source", "files") == "recipes":
+            return self._init_data_recipes()
+        assert str(self.cfg.data.get("particle_order", "none")) == "none" and \
+            not self.cfg.data.get("affine_multiplicity_std", False), \
+            "data.particle_order / data.affine_multiplicity_std are implemented on the recipe path only"
+
+        LOGGER.info(f"Loading datasets: {self.cfg.data.dataset}")
+
+        (
+            self.particles,
+            self.amplitudes,
+            self.particles_prepd,
+            self.pdg_ids,
+            self.mom_mean,
+            self.mom_std,
+        ) = ([], [], [], [], [], [])
+
+        # Normalise per-dataset subsample spec to a list[int|None]
+        subsample_cfg = self.cfg.data.subsample
+        if subsample_cfg is None or (isinstance(subsample_cfg, str) and subsample_cfg.lower() in ("none", "null")):
+            subsample_per_ds = [None] * len(self.cfg.data.dataset)
+        elif OmegaConf.is_list(subsample_cfg) or isinstance(subsample_cfg, (list, tuple)):
+            subsample_per_ds = [int(s) if s is not None else None for s in subsample_cfg]
+        else:
+            subsample_per_ds = [int(subsample_cfg)] * len(self.cfg.data.dataset)
+
+        for dataset, sub_n in zip(self.cfg.data.dataset, subsample_per_ds):
+            data_path = os.path.join(self.cfg.data.data_path, f"{dataset}.npy")
+            assert os.path.exists(data_path), f"data_path {data_path} does not exist"
+            data_raw = np.load(data_path)
+            if sub_n is not None:
+                data_raw = data_raw[:sub_n]
+            LOGGER.info(f"Loaded data with shape {data_raw.shape} from {data_path}")
+    
+            n_particles  = (data_raw.shape[1] - 1) // 5
+            momenta_cols = n_particles * 4
+    
+            particles  = data_raw[:, :momenta_cols]
+            pdg_ids    = data_raw[:, momenta_cols:-1].astype(int)
+            amplitudes = data_raw[:, [-1]]
+    
+            use_pids = self.cfg.data.get("use_PIDs", False)
+            if use_pids:
+                type_tokens = self.tokenizer.register_and_encode(pdg_ids)
+            else:
+                # Global fixed encoding: PDG ID → property-table index.
+                # Independent of the training dataset, so a new BSM particle added
+                # to PARTICLE_PROPERTIES in particle_ids.py is immediately usable
+                # at inference without any model changes.
+                from particle_ids import global_encode
+                type_tokens = global_encode(pdg_ids)
+                self.tokenizer.register_and_encode(pdg_ids)  # keep tokenizer in sync for use_PIDs=True warm starts
+
+            # Raw per-slot PDG order (fixed per process) for the Tier-B leg→slot map.
+            if not hasattr(self, "_slot_pdgs_by_name"):
+                self._slot_pdgs_by_name = {}
+            self._slot_pdgs_by_name.setdefault(dataset, [int(x) for x in pdg_ids[0]])
+
+            if self.modelname in ("LLOCATransformer", "LLOCAMuPTransformer", "MuPLGATr", "MuPLGATrSlim"):
+                particles_t = torch.tensor(particles, dtype=torch.float64)
+                particles_t = particles_t.reshape(-1, n_particles, 4)
+    
+                m2 = particles_t[..., 0] ** 2 - (particles_t[..., 1:] ** 2).sum(dim=-1)
+                particles_t[..., 0] = torch.sqrt(
+                    (particles_t[..., 1:] ** 2).sum(dim=-1) + m2.clamp(min=0)
+                )
+    
+                lab_particles = particles_t[..., :2, :].sum(dim=-2)
+                to_com = restframe_boost(lab_particles)
+                trafo = rand_lorentz(
+                    particles_t.shape[:-2], generator=None, dtype=particles_t.dtype
+                )
+                trafo = torch.einsum("...ij,...jk->...ik", trafo, to_com)
+                particles_t = torch.einsum("...ij,...kj->...ki", trafo, particles_t)
+    
+                _mom_div_ds = float(particles_t.std())
+                particles_prepd = particles_t / _mom_div_ds
+                self.mom_mean.append(float(particles_prepd.mean()))
+                self.mom_std.append(float(particles_prepd.std().clamp(min=1e-2)))
+                # Single-dataset legacy path has a well-defined global scale; with
+                # several datasets each is scaled independently so there is no single
+                # mom_div (mass_from_momenta is then unsupported — asserted at setup).
+                self.mom_div = _mom_div_ds if self.n_datasets == 1 else None
+                particles_prepd = particles_prepd.numpy()  # (N, n_particles, 4)
+            else:
+                LOGGER.info(f"Preprocessing particles using trafos={self.cfg.data.trafos}")
+                particles_prepd = preprocess_particles(
+                    particles,
+                    type_tokens[0],
+                    trafos=self.cfg.data.trafos,
+                    incl_fvs=self.cfg.data.incl_fvs,
+                )
+    
+            self.particles.append(particles)
+            self.amplitudes.append(amplitudes)
+            self.particles_prepd.append(particles_prepd)
+            self.pdg_ids.append(type_tokens)
+    
+        # ------------------------------------------------------------------
+        # Build flat per-event lists and concatenate amplitudes
+        # ------------------------------------------------------------------
+        is_lloca = self.modelname in ("LLOCATransformer", "LLOCAMuPTransformer", "MuPLGATr", "MuPLGATrSlim")
+    
+        all_particles_list = []
+        all_tokens_list    = []
+        all_amplitudes_raw = []
+        all_process_ids    = []   # integer process index per event
+
+        # amp_orders: list of [n_loops, alpha_s_power] per dataset, name-keyed
+        # (NLO/NNLO targets labelled from their dataset name; LO otherwise).
+        amp_orders = self._resolve_amp_orders(self.cfg.data.dataset)
+        n_order_features = len(self._order_row(0, amp_orders))
+
+        all_order_labels = []   # will be (N_events, n_order_features)
+
+        for proc_idx, (parts, toks, amps) in enumerate(zip(self.particles_prepd, self.pdg_ids, self.amplitudes)):
+            N = parts.shape[0]
+            if is_lloca:
+                # parts: (N, n_particles, 4) → list of (n_particles, 4)
+                all_particles_list.extend([parts[j] for j in range(N)])
+            else:
+                all_particles_list.extend([parts[j] for j in range(N)])
+            all_tokens_list.extend([toks[j] for j in range(N)])
+            all_amplitudes_raw.append(amps)
+            all_process_ids.extend([proc_idx] * N)
+            self._proc_npart[proc_idx] = int(parts.shape[1])
+            order_row = self._order_row(proc_idx, amp_orders)
+            all_order_labels.append(np.tile(order_row, (N, 1)))  # (N, n_order_features)
+
+        all_order_labels = np.concatenate(all_order_labels, axis=0)  # (N_total, n_order_features)
+
+        all_amplitudes_raw = np.concatenate(all_amplitudes_raw, axis=0)  # (N_total, 1)
+        all_process_ids    = np.array(all_process_ids, dtype=np.int32)   # (N_total,)
+    
+        # ------------------------------------------------------------------
+        # Global amplitude preprocessing across all datasets combined
+        # ------------------------------------------------------------------
+        # Swap 'log' -> 'signedlog' when amplitudes contain non-positive values
+        # (e.g. virtual corrections / virt-born ratios). Store the resolved list back
+        # on the config so the inverse (undo_preprocess_amplitude) uses the same one.
+        amp_trafos = resolve_amp_trafos(self.cfg.data.amp_trafos, all_amplitudes_raw,
+                                        scale_quantile=self._signedlog_quantile(),
+                                        scale_shift=self._signedlog_scale_shift())
+        self.cfg.data.amp_trafos = amp_trafos
+        LOGGER.info(
+            f"Preprocessing amplitudes globally using trafos={amp_trafos}"
+        )
+        all_amplitudes_prepd, prepd_mean, prepd_std = preprocess_amplitude(
+            all_amplitudes_raw, trafos=amp_trafos
+        )
+        self.prepd_mean = [prepd_mean]
+        self.prepd_std  = [prepd_std]
+        LOGGER.info(
+            f"Combined amplitude stats after preprocessing: "
+            f"mean={all_amplitudes_prepd.mean():.3f}, "
+            f"std={all_amplitudes_prepd.std():.3f}, "
+            f"min={all_amplitudes_prepd.min():.3f}, "
+            f"max={all_amplitudes_prepd.max():.3f}"
+        )
+    
+        # ------------------------------------------------------------------
+        # Shuffle with fixed seed
+        # ------------------------------------------------------------------
+        N_total = len(all_particles_list)
+        rng  = np.random.default_rng(seed=42)
+        perm = rng.permutation(N_total)
+    
+        all_particles_list   = [all_particles_list[i]   for i in perm]
+        all_tokens_list      = [all_tokens_list[i]      for i in perm]
+        all_amplitudes_prepd = all_amplitudes_prepd[perm]
+        all_process_ids      = all_process_ids[perm]
+        all_order_labels     = all_order_labels[perm]
+    
+        # ------------------------------------------------------------------
+        # Build contiguous flat arrays for fast O(1) indexing in DataLoader
+        # ------------------------------------------------------------------
+        from dataset import build_flat_arrays
+        particles_flat, tokens_flat, offsets = build_flat_arrays(
+            all_particles_list, all_tokens_list
+        )
+        self.particles_flat    = particles_flat       # (N_total_particles, 4)
+        self.tokens_flat       = tokens_flat          # (N_total_particles,)
+        self.offsets           = offsets              # (N_events, 2)
+        self.all_amplitudes    = all_amplitudes_prepd # (N_events, 1)
+        self.all_process_ids   = all_process_ids      # (N_events,)
+        self.all_order_labels  = all_order_labels     # (N_events, n_order_features)
+        self.n_order_features  = n_order_features
+        self.N_events          = N_total
+
+        self._finalize_data_sizing()
+
+    def _finalize_data_sizing(self):
+        """Shared tail of data init (legacy + recipe paths): derive the particle
+        feature / order dimensions from the populated tokenizer + flat arrays and
+        write the model in_channels, then save the tokenizer."""
+        is_lloca = self.modelname in (
+            "LLOCATransformer", "LLOCAMuPTransformer", "MuPLGATr", "MuPLGATrSlim"
+        )
+        LOGGER.info(f"Combined dataset: {self.N_events} events"
+                    + (" (memmap: particles gathered per batch)" if getattr(self, "_mmap_src", None) is not None
+                       else f", {self.particles_flat.shape[0]} total particles"))
+
+        # ------------------------------------------------------------------
+        # Set model size — particle feature dimension depends on encoding mode
+        # ------------------------------------------------------------------
+        token_size = self.tokenizer.vocab_size
+        _pv = getattr(self, "_parent_vocab_size", None)
+        if self.cfg.data.get("use_PIDs", False) and _pv is not None and token_size > _pv:
+            # one-hot PIDs have no input for a particle the parent never saw: refuse, never a silent remap
+            raise ValueError(f"use_PIDs: this run's particles need {token_size} tokens, the parent's one-hot "
+                             f"vocabulary has {_pv}: a PDG id the parent never saw has no encoding")
+        self.token_size = token_size
+        with open_dict(self.cfg):
+            self.cfg.model.token_size = token_size
+
+        if is_lloca:
+            use_pids = self.cfg.data.get("use_PIDs", False)
+            if use_pids:
+                particle_feature_dim = token_size
+                self.property_matrix = None
+                LOGGER.info(f"Particle encoding: one-hot PIDs (vocab_size={token_size})")
+            else:
+                from particle_ids import (
+                    ParticleFeaturizer, GLOBAL_N_ENTRIES, build_property_matrix,
+                )
+                # Smart-encoding transforms of the physical property vector, each
+                # off by default so warm-start/fine-tune from existing checkpoints
+                # stay valid (they change the encoder's *input* width — but not
+                # n_scalars, which is fixed at d_particle_hidden + n_order_features):
+                #   spin_onehot       — one-hot the categorical spin column
+                #   color_onehot      — one-hot the SU(3) color representation
+                #   prop_is_massless  — explicit "exactly massless" flag + neutralise sentinel
+                #   standardize_props — z-score the continuous columns
+                spin_onehot   = self.cfg.data.get("spin_onehot", False)
+                color_onehot  = self.cfg.data.get("color_onehot", False)
+                is_massless   = self.cfg.data.get("prop_is_massless", False)
+                standardize   = self.cfg.data.get("standardize_props", False)
+                #   generation_onehot — one-hot the fermion generation (separates d from s,
+                #                       u from c, which are both massless in the generator)
+                generation_onehot = self.cfg.data.get("generation_onehot", False)
+                generation_feature = bool(self.cfg.data.get("generation_feature", True))
+                self.property_matrix, _ = build_property_matrix(
+                    spin_onehot=spin_onehot, color_onehot=color_onehot,
+                    is_massless=is_massless, standardize=standardize,
+                    generation_onehot=generation_onehot, generation_feature=generation_feature,
+                )
+                # d_particle_hidden is the fixed projection output dim.
+                # in_channels and num_scalars use this fixed dim — they never
+                # change when quantum numbers are added, only the tiny projection
+                # matrix (n_features → d_particle_hidden) needs extending.
+                d_hidden = self.cfg.model.get("d_particle_hidden", 16)
+                particle_feature_dim = d_hidden
+                _enc = "+".join(
+                    [n for n, on in (("spin1hot", spin_onehot),
+                                     ("color1hot", color_onehot),
+                                     ("nogen", not generation_feature),
+                                     ("gen1hot", generation_onehot and generation_feature),
+                                     ("masslessflag", is_massless),
+                                     ("std", standardize)) if on]
+                ) or "raw"
+                LOGGER.info(
+                    f"Particle encoding: physical properties "
+                    f"({self.property_matrix.shape[1]}D [{_enc}] "
+                    f"→ projected to {d_hidden}D) | "
+                    f"global table covers {GLOBAL_N_ENTRIES - 1} particle species"
+                )
+            # n_order_features extra scalars per particle (same value broadcast across event)
+            n_scalars   = particle_feature_dim + self.n_order_features
+
+            # Feynman-diagram conditioning: load each process's diagram graphs and
+            # widen the scalar channel by d_diag (the appended diagram embedding).
+            # The 'ours' encoder requires the property encoding (use_PIDs=false). Off → no change.
+            # the 'ours' encoder builds its nodes from the property table; arXiv:2606.23791's (llm4lhc) labels edges
+            # by its own PDG vocabulary and adds its vector inside the backbone, so it runs under use_PIDs too
+            self._diag_impl = str(self.cfg.model.get("diagram_encoder_impl", "ours"))
+            self._use_diagrams = (
+                (not use_pids or self._diag_impl == "llm4lhc")
+                and bool(self.cfg.model.get("use_diagrams", False))
+            )
+            if self._diag_impl not in ("ours", "llm4lhc"):
+                raise ValueError(f"model.diagram_encoder_impl={self._diag_impl!r}; "
+                                 "valid: 'ours', 'llm4lhc'")
+            if self._use_diagrams and self._diag_impl == "llm4lhc":
+                # arXiv:2606.23791's encoder: its vector is added to the token
+                # embeddings inside the backbone, so n_scalars is NOT widened.
+                self._setup_diagram_set_llm4lhc(list(self.cfg.data.dataset))
+            elif self._use_diagrams:
+                self._d_diag = int(self.cfg.model.get("d_diag", 32))
+                self._use_diag_virt = bool(self.cfg.model.get("use_diagram_virtuality", False))
+                self._setup_diagram_registry(
+                    list(self.cfg.data.dataset),
+                    spin_onehot=spin_onehot, color_onehot=color_onehot,
+                    is_massless=is_massless, standardize=standardize,
+                    generation_onehot=generation_onehot, generation_feature=generation_feature,
+                    build_virtuality=self._use_diag_virt,
+                    couplings_by_pid=getattr(self, "_coupling_by_pid", None),
+                    internal_mass_by_pid=getattr(self, "_internal_mass_by_proc", None),
+                    internal_mass_pdgs=getattr(self, "_internal_mass_pdgs", None),
+                    scanned_mass=bool(self.cfg.model.get("diagram_scanned_mass", False)),
+                )
+                n_scalars += self._d_diag
+                LOGGER.info(
+                    f"Diagram conditioning: ON (d_diag={self._d_diag}); "
+                    f"n_scalars {n_scalars - self._d_diag}→{n_scalars}"
+                )
+
+            # Pairwise attention bias (model.use_pair_bias): reads the same diagram
+            # sidecars but is independent of the diagram ENCODER above — no input
+            # widening (n_scalars unchanged); the signal enters the attention logits.
+            # Specs built here so _post_instantiate_model can attach them.
+            self._use_pair_bias = (
+                not use_pids and bool(self.cfg.model.get("use_pair_bias", False))
+            )
+            if self._use_pair_bias:
+                self._pair_bias_specs = self._setup_pair_bias_specs(
+                    list(self.cfg.data.dataset))
+
+            _npl = int(self.cfg.model.get("input_pair_logs", 0) or 0)
+            n_scalars += _npl * (_npl - 1) // 2   # model.input_pair_logs: one log invariant per pair (wrappers)
+            if self.cfg.model.get("input_div_form", False):   # wrappers._div_form_inputs columns
+                from wrappers import _div_form_width
+                n_scalars += _div_form_width(_npl)
+            if self.cfg.model.get("input_asym_factor", False):   # wrappers._asym_mu: one more per-particle readout row
+                with open_dict(self.cfg):
+                    self.cfg.model.net.extra_main = 1
+
+            with open_dict(self.cfg):
+                if self.modelname in ("MuPLGATr", "MuPLGATrSlim"):
+                    # GATr nets: the 4-momentum is the (multi)vector input (in_*v_channels=1
+                    # in the config), the particle/order encoding are the scalar inputs.
+                    self.cfg.model.net.in_s_channels = n_scalars
+                else:
+                    self.cfg.model.net.in_channels = n_scalars + 4
+                    self.cfg.model.net.num_scalars = n_scalars
+            LOGGER.info(
+                f"Order encoding: {self.n_order_features} features "
+                f"(e.g. [L_QCD, L_EW, alpha_s_max, alpha_ew_max]) → n_scalars={n_scalars}"
+            )
+        else:
+            with open_dict(self.cfg):
+                if self.modelname == "LGATr":
+                    self.cfg.model.net.in_s_channels = token_size
+
+        if self.cfg.save:
+            tokenizer_path = os.path.join(self.cfg.run_dir, "particle_tokenizer.json")
+            self.tokenizer.save(tokenizer_path)
+            LOGGER.info(f"Saved tokenizer with vocab_size={token_size}")
+            
+    def _resolve_diagram_path(self, diagrams_dir, name):
+        """Locate a process's diagram sidecar, tolerating dataset-name decoration.
+
+        Recipe-mode names are registry keys (``ee_ttbar``) that match sidecar files
+        directly; file-stem names (``ee_ttbar_346-1000GeV_amplitudes``) are retried
+        after stripping a trailing ``_amplitudes`` and an energy tag. Returns the
+        path or None."""
+        import re
+        cands = [name]
+        # an entry read with another process's diagrams (diagrams_of: a held-out one-loop class's default-sampled
+        # pool, MadEvent Born events labelled by the class's MadLoop, reads the class's one-loop sidecar), first
+        import mg5_pipeline_final as _mg
+        _dof = (_mg.PROCESSES.get(name) or {}).get("diagrams_of")
+        if _dof:
+            cands = [_dof]
+        # explicit recipe ``base`` (coupling/mass scan: decorated name → real process)
+        recipe_base = getattr(self, "_recipe_base_by_name", {}).get(name)
+        if recipe_base and recipe_base not in cands:
+            cands.append(recipe_base)
+        base = re.sub(r"_amplitudes$", "", name)
+        base = re.sub(r"_\d+(?:\.\d+)?(?:-\d+(?:\.\d+)?)?GeV$", "", base)
+        if base not in cands:
+            cands.append(base)
+        for c in cands:
+            p = os.path.join(diagrams_dir, f"{c}.diagrams.json")
+            if os.path.exists(p):
+                return p
+        return None
+
+    def _setup_offshell_masks(self, names, pdgs=None):
+        """Per-process propagator masks for the DIRECT off-shellness feature.
+
+        Returns a list aligned with ``names``; each entry is
+        ``{pdg: [(mask (n_part,) float64 signed, M² float)]}`` for every internal
+        propagator carrying one of ``self._internal_mass_pdgs``, or None where the
+        process has no diagram sidecar / unmappable legs. The mask contracts with the
+        event's per-slot momenta to give s_prop=(Σ sign·p)²; off-shellness = s_prop−M².
+        Built once (topology is per-process, not per-event) and applied in the
+        assembly loop. Independent of the diagram encoder (use_diagrams): this feeds
+        the main transformer directly, which is where the signal survives."""
+        from diagram_graphs import build_process_diagrams, build_process_virtuality
+        from particle_ids import build_property_matrix
+        pdgs = [int(p) for p in (self._internal_mass_pdgs if pdgs is None else pdgs) or []]
+        if not pdgs:
+            return None
+        diagrams_dir = self.cfg.model.get("diagrams_dir", "data/diagrams")
+        if not os.path.isabs(diagrams_dir):
+            diagrams_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), diagrams_dir)
+        prop_matrix, _ = build_property_matrix(
+            spin_onehot=bool(self.cfg.data.get("spin_onehot", False)),
+            color_onehot=bool(self.cfg.data.get("color_onehot", False)),
+            is_massless=bool(self.cfg.data.get("prop_is_massless", True)),
+            standardize=bool(self.cfg.data.get("standardize_props", True)),
+            generation_onehot=bool(self.cfg.data.get("generation_onehot", False)),
+            generation_feature=bool(self.cfg.data.get("generation_feature", True)),
+        )
+        k_pe = int((self.cfg.model.get("diagram_encoder", {}) or {}).get("k_pe", 8))
+        slot_map = getattr(self, "_slot_pdgs_by_name", {})
+        imp = getattr(self, "_internal_mass_by_proc", None)
+        by_proc, n_ok = [], 0
+        for i, name in enumerate(names):
+            slot_pdgs = slot_map.get(name)
+            path = self._resolve_diagram_path(diagrams_dir, name)
+            if path is None or slot_pdgs is None:
+                by_proc.append(None); continue
+            pd = build_process_diagrams(path, prop_matrix, k_pe=k_pe)
+            n_initial = sum(1 for leg in (pd.external or []) if leg["state"] == "in")
+            # scanned propagator masses for this dataset → the pole is at the SCANNED M²
+            # (the table is aligned with internal_mass_pdgs, whatever list is requested here)
+            im_list = [int(x) for x in (self._internal_mass_pdgs or [])]
+            mo = {pdg: float(imp[i][j]) for j, pdg in enumerate(im_list) if j < len(imp[i])} \
+                if (imp and i < len(imp) and imp[i]) else None
+            vt = build_process_virtuality(pd, [int(x) for x in slot_pdgs], n_initial,
+                                          mass_override=mo, offshell=True)
+            if vt is None:
+                by_proc.append(None); continue
+            mask = vt["mask"].numpy().astype(np.float64)   # (K, n_part)
+            m2   = vt["prop_mass2"].numpy()                # (K,)
+            ppdg = list(vt["prop_pdgs"])                   # (K,)
+            sel = {}
+            for pdg in pdgs:
+                uniq = []
+                for k in range(len(ppdg)):
+                    # MadGraph orients self-conjugate propagators arbitrarily (−23 Z,
+                    # −22 γ), so match on |pdg| (same canonicalisation as _phys_mass).
+                    if abs(ppdg[k]) != abs(pdg):
+                        continue
+                    mrow, mm = mask[k], float(m2[k])
+                    # collapse identical propagators shared across diagrams (same
+                    # s-channel edge appears once per diagram → one physical value)
+                    if not any(np.array_equal(mrow, u[0]) and mm == u[1] for u in uniq):
+                        uniq.append((mrow, mm))
+                sel[pdg] = uniq
+            by_proc.append(sel)
+            n_ok += 1
+        LOGGER.info(f"offshell_per_event: built propagator masks for {n_ok}/{len(names)} "
+                    f"processes, pdgs {pdgs}")
+        return by_proc
+
+    def _setup_pair_bias_specs(self, names):
+        """Per-process propagator specs for the PAIRWISE attention bias
+        (``model.use_pair_bias``); see wrappers.setup_pair_bias.
+
+        For every internal propagator (ALL of them — unlike _setup_offshell_masks,
+        which keeps only the internal_mass_pdgs channels) this yields the signed
+        momentum-gather row + physical m², deduplicated across diagrams up to a
+        global sign flip (s = (Σ sign·p)² is invariant under row → −row, and by
+        momentum conservation a leg set and its complement give the same s). The
+        propagator's bias lands on the ordered particle pairs inside its resonating
+        cluster: the SMALLER of the two leg clusters it cuts the process into (both
+        clusters when they tie — e.g. 2→2, where the s-channel needle lives in the
+        final pair). Propagator count is capped (smallest clusters first, then
+        massive before massless) by ``model.pair_bias_max_props``.
+
+        Returns a list aligned with ``names``: None (no sidecar / unmappable) or
+        {"mask": (K,n_part) f32, "m2": (K,) f32, "trips": (T,3) i64 rows (k,i,j)}.
+        """
+        from diagram_graphs import build_process_diagrams, build_process_virtuality
+        from particle_ids import build_property_matrix
+        diagrams_dir = self.cfg.model.get("diagrams_dir", "data/diagrams")
+        if not os.path.isabs(diagrams_dir):
+            diagrams_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), diagrams_dir)
+        prop_matrix, _ = build_property_matrix(
+            spin_onehot=bool(self.cfg.data.get("spin_onehot", False)),
+            color_onehot=bool(self.cfg.data.get("color_onehot", False)),
+            is_massless=bool(self.cfg.data.get("prop_is_massless", True)),
+            standardize=bool(self.cfg.data.get("standardize_props", True)),
+            generation_onehot=bool(self.cfg.data.get("generation_onehot", False)),
+            generation_feature=bool(self.cfg.data.get("generation_feature", True)),
+        )
+        k_pe = int((self.cfg.model.get("diagram_encoder", {}) or {}).get("k_pe", 8))
+        max_props = int(self.cfg.model.get("pair_bias_max_props", 48))
+        slot_map = getattr(self, "_slot_pdgs_by_name", {})
+        imp = getattr(self, "_internal_mass_by_proc", None)
+        im_pdgs = [int(p) for p in (getattr(self, "_internal_mass_pdgs", None) or [])]
+        by_proc, n_ok, n_props_tot = [], 0, 0
+        for i, name in enumerate(names):
+            slot_pdgs = slot_map.get(name)
+            path = self._resolve_diagram_path(diagrams_dir, name)
+            if path is None or slot_pdgs is None:
+                by_proc.append(None); continue
+            pd = build_process_diagrams(path, prop_matrix, k_pe=k_pe)
+            n_initial = sum(1 for leg in (pd.external or []) if leg["state"] == "in")
+            # scanned propagator masses for this dataset → the pole is at the SCANNED m²
+            mo = {pdg: float(imp[i][j]) for j, pdg in enumerate(im_pdgs)} \
+                if (imp and i < len(imp) and imp[i]) else None
+            vt = build_process_virtuality(pd, [int(x) for x in slot_pdgs], n_initial,
+                                          mass_override=mo, offshell=True)
+            if vt is None:
+                by_proc.append(None); continue
+            mask = vt["mask"].numpy().astype(np.float32)   # (K_all, n_part)
+            m2   = vt["prop_mass2"].numpy().astype(np.float32)
+            n_part = mask.shape[1]
+            # dedup up to a global sign flip (identical propagator across diagrams,
+            # or the complementary leg set — same physical invariant)
+            uniq = []
+            seen = set()
+            for k in range(mask.shape[0]):
+                row = mask[k]
+                nz = np.nonzero(row)[0]
+                if nz.size == 0:
+                    continue
+                crow = row if row[nz[0]] > 0 else -row     # canonical sign
+                key = (crow.tobytes(), round(float(m2[k]), 6))
+                ckey = ((-crow).tobytes(), round(float(m2[k]), 6))
+                if key in seen or ckey in seen:
+                    continue
+                seen.add(key)
+                uniq.append((row, float(m2[k])))
+            if not uniq:
+                by_proc.append(None); continue
+            # resonating cluster = smaller side of the cut (both when they tie)
+            def sides(row):
+                sup = set(np.nonzero(row)[0].tolist())
+                comp = set(range(n_part)) - sup
+                if len(sup) < len(comp):
+                    return [sorted(sup)]
+                if len(comp) < len(sup):
+                    return [sorted(comp)]
+                return [sorted(sup), sorted(comp)]
+            # cap: smallest clusters first (2-body needles), massive before massless
+            uniq.sort(key=lambda u: (min(int(np.count_nonzero(u[0])),
+                                         n_part - int(np.count_nonzero(u[0]))),
+                                     -u[1]))
+            uniq = uniq[:max_props]
+            rows, masses, pfeat, trips = [], [], [], []
+            for k, (row, mm) in enumerate(uniq):
+                pairs = [(a, b) for side in sides(row) if len(side) > 1
+                         for a in side for b in side if a != b]
+                if not pairs:
+                    continue
+                rows.append(row); masses.append(mm)
+                # propagator identity for the bias head: [log10(m)/2, massless flag]
+                # — the same off-shellness means different physics per propagator type
+                mprop = float(np.sqrt(max(mm, 0.0)))
+                pfeat.append([np.log10(max(mprop, 1e-3)) / 2.0,
+                              1.0 if mprop < 1e-3 else 0.0])
+                kk = len(rows) - 1
+                trips.extend((kk, a, b) for a, b in pairs)
+            if not trips:
+                by_proc.append(None); continue
+            by_proc.append({
+                "mask": np.stack(rows).astype(np.float32),
+                "m2": np.asarray(masses, dtype=np.float32),
+                "pfeat": np.asarray(pfeat, dtype=np.float32),
+                "trips": np.asarray(trips, dtype=np.int64),
+            })
+            n_ok += 1
+            n_props_tot += len(rows)
+        LOGGER.info(f"pair_bias: built propagator pair specs for {n_ok}/{len(names)} "
+                    f"processes ({n_props_tot} propagators total, cap {max_props}/proc)")
+        return by_proc
+
+    def _setup_diagram_set_llm4lhc(self, names):
+        """Build the arXiv:2606.23791 diagram set (models/diagram_encoder_llm4lhc) for
+        the processes ``names`` (index = process_id). Every process needs its sidecar:
+        a missing one would silently leave that process unconditioned, so it raises (as
+        their loader does)."""
+        from models.diagram_encoder_llm4lhc import load_llm4lhc_diagram_set
+        if self.modelname != "LLOCAMuPTransformer":
+            raise ValueError("model.diagram_encoder_impl=llm4lhc is wired for the LLoCa "
+                             f"μP transformer only (got {self.modelname})")
+        for flag in ("use_diagram_virtuality", "diagram_scanned_mass"):
+            if bool(self.cfg.model.get(flag, False)):
+                raise ValueError(f"model.{flag}=true has no effect with "
+                                 "diagram_encoder_impl=llm4lhc (no masses or momenta enter "
+                                 "their encoder); set it false")
+        cfg = self.cfg.model.get("diagram_encoder_llm4lhc", {}) or {}
+        diagrams_dir = self.cfg.model.get("diagrams_dir", "data/diagrams")
+        if not os.path.isabs(diagrams_dir):
+            diagrams_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), diagrams_dir)
+        paths = [self._resolve_diagram_path(diagrams_dir, n) for n in names]
+        missing = [n for n, p in zip(names, paths) if p is None]
+        if missing:
+            raise FileNotFoundError(
+                f"diagram_encoder_llm4lhc: no sidecar in {diagrams_dir} for {missing}; "
+                "generate them with `python tools/dump_diagrams.py --all`")
+        max_d = cfg.get("max_diagrams", None)
+        slot = None
+        if bool(cfg.get("virtuality_pool", False)):
+            smap = getattr(self, "_slot_pdgs_by_name", {})
+            assert all(n in smap for n in names), "virtuality_pool: per-slot PDG order missing for a process"
+            slot = [smap[n] for n in names]
+            # each process's generator masses and widths (an lhe_pp entry's param card), else the property table's
+            import mg5_pipeline_final as mg
+            from models.diagram_encoder_llm4lhc import param_card_mass_width
+            mw = [param_card_mass_width(mg.lhe_cards(mg.PROCESSES[n])[1]) if n in mg.PROCESSES and mg.is_lhe_pp(n)
+                  else None for n in names]
+        self._diag_set_llm4lhc = load_llm4lhc_diagram_set(
+            paths, laplacian_pe_dim=int(cfg.get("laplacian_pe_dim", 8)),
+            max_diagrams=int(max_d) if max_d is not None else None, slot_pdgs=slot,
+            mass_width=mw if slot is not None else None, bsm_labels=bool(cfg.get("bsm_labels", False)))
+        if slot is not None:
+            ok = self._diag_set_llm4lhc.virt_ok
+            LOGGER.info(f"virtuality_pool: internal lines placed for {int(ok.sum())}/{len(names)} processes "
+                        f"({int(self._diag_set_llm4lhc.virt_mask.shape[0])} lines)"
+                        + ("" if bool(ok.all()) else f"; without: {[n for n, o in zip(names, ok.tolist()) if not o][:10]}"))
+        nd = self._diag_set_llm4lhc.n_diagrams
+        LOGGER.info(
+            f"Diagram conditioning (llm4lhc, mode={cfg.get('mode', 'pooled')}): "
+            f"{self._diag_set_llm4lhc.n_total} diagrams over {len(names)} processes "
+            f"(per process min {int(nd.min())}, max {int(nd.max())}), "
+            f"N_max={int(self._diag_set_llm4lhc.node_types.shape[1])} nodes; "
+            f"added to the token embeddings, n_scalars unchanged")
+
+    def _setup_diagram_registry(self, names, spin_onehot, color_onehot,
+                                is_massless, standardize, generation_onehot=False, generation_feature=True, build_virtuality=False,
+                                couplings_by_pid=None,
+                                internal_mass_by_pid=None, internal_mass_pdgs=None,
+                                scanned_mass=False):
+        """Load each process's diagram graphs into ``self._diag_pd_by_pid`` (indexed
+        by process_id == position in ``data.dataset``). The property matrix uses the
+        SAME smart-encoding flags as the particle encoder, so diagram particles ride
+        the identical physical-quantity encoding. Missing sidecars → None (that
+        process gets a zero diagram embedding; the run still works).
+
+        ``couplings_by_pid`` : list[{order_key: alpha} | None] aligned with ``names``.
+        When any entry is set, every vertex gets per-vertex log coupling-factor
+        columns from that dataset's coupling values (see build_process_diagrams).
+        Datasets without couplings are still given the columns (filled 0) so F_node
+        stays uniform across the batched encoder forward."""
+        from diagram_graphs import build_process_diagrams, feature_dims
+        from particle_ids import build_property_matrix
+
+        diagrams_dir = self.cfg.model.get("diagrams_dir", "data/diagrams")
+        if not os.path.isabs(diagrams_dir):
+            diagrams_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), diagrams_dir)
+        enc_cfg = self.cfg.model.get("diagram_encoder", {}) or {}
+        k_pe = int(enc_cfg.get("k_pe", 8))
+        max_diagrams = enc_cfg.get("max_diagrams", None)
+        max_diagrams = int(max_diagrams) if max_diagrams is not None else None
+
+        prop_matrix, _ = build_property_matrix(
+            spin_onehot=spin_onehot, color_onehot=color_onehot,
+            is_massless=is_massless, standardize=standardize,
+            generation_onehot=generation_onehot, generation_feature=generation_feature,
+        )
+        # Couplings on vertices: if ANY dataset carries coupling values, every
+        # process gets the coupling columns (0-filled where absent) so the batched
+        # encoder sees one uniform F_node.
+        use_couplings = bool(couplings_by_pid) and any(c for c in couplings_by_pid)
+        empty_coupl = {} if use_couplings else None   # {} → columns present, all 0
+
+        # Scanned internal (propagator) mass: build a per-dataset property-matrix copy
+        # with the SCANNED mass in the propagator's mass column, so its diagram
+        # propagator edge carries the scanned value (not the stale table mass). With
+        # Tier-B virtuality on the same edge, the encoder can form the propagator
+        # off-shellness locally. Off (default) → the frozen table mass, as before.
+        im_by_pid = internal_mass_by_pid or []
+        im_pdgs   = [int(p) for p in (internal_mass_pdgs or [])]
+        mass_spec = None
+        if scanned_mass and im_pdgs and any(im_by_pid):
+            from particle_ids import mass_feature_spec, GLOBAL_PDG_IDX
+            mass_spec = mass_feature_spec(spin_onehot=spin_onehot, color_onehot=color_onehot,
+                                          is_massless=is_massless, standardize=standardize,
+                                          generation_onehot=generation_onehot, generation_feature=generation_feature)
+
+        def _encode_mass(m):
+            s = mass_spec
+            lm = np.log10(max(float(m), 10.0 ** s["floor_log10"]))
+            if s["neutralize_log10"] is not None and lm < s["threshold_log10"]:
+                lm = s["neutralize_log10"]
+            if s["std_mu"] is not None:
+                lm = (lm - s["std_mu"]) / s["std_sd"]
+            return float(lm)
+
+        def _prop_matrix_for(i):
+            if mass_spec is None:
+                return prop_matrix
+            row = im_by_pid[i] if i < len(im_by_pid) else None
+            if not row:
+                return prop_matrix
+            pm = prop_matrix.copy()
+            for j, pdg in enumerate(im_pdgs):
+                idx = GLOBAL_PDG_IDX.get(pdg)
+                if idx is not None:
+                    pm[idx, mass_spec["mass_col"]] = _encode_mass(row[j])
+            return pm
+
+        pd_by_pid, missing = [], []
+        for i, name in enumerate(names):
+            path = self._resolve_diagram_path(diagrams_dir, name)
+            if path is None:
+                pd_by_pid.append(None)
+                missing.append(name)
+                continue
+            cpl = (couplings_by_pid[i] if couplings_by_pid else None) or empty_coupl
+            pd_by_pid.append(build_process_diagrams(
+                path, _prop_matrix_for(i), k_pe=k_pe, max_diagrams=max_diagrams,
+                couplings=cpl))
+        if mass_spec is not None:
+            LOGGER.info(f"Diagram scanned-mass ON: propagator mass column overridden "
+                        f"per-dataset for pdgs {im_pdgs}")
+
+        self._diag_pd_by_pid = pd_by_pid
+        self._diag_feature_dims = feature_dims(
+            prop_matrix.shape[1], with_couplings=use_couplings)   # (f_node, f_edge)
+        self._diag_k_pe = k_pe
+
+        # Tier B: per-process propagator-virtuality precompute. Needs the event's
+        # per-slot PDG order (recover raw PDG from the stored property-table indices
+        # via the inverse global map) and the number of initial-state legs.
+        self._diag_virt_by_pid = None
+        if build_virtuality:
+            from diagram_graphs import build_process_virtuality
+            slot_map = getattr(self, "_slot_pdgs_by_name", {})            # set in both data paths
+            virt, n_virt = [], 0
+            for i, pd in enumerate(pd_by_pid):
+                slot_pdgs = slot_map.get(names[i])
+                if pd is None or slot_pdgs is None:
+                    virt.append(None); continue
+                n_initial = sum(1 for leg in (pd.external or []) if leg["state"] == "in")
+                # Off-shellness (s − m²) with the SCANNED propagator masses when
+                # diagram_scanned_mass is on — the resonance-aware Tier-B feature.
+                mo = None
+                if scanned_mass and im_pdgs and i < len(im_by_pid) and im_by_pid[i]:
+                    mo = {pdg: float(im_by_pid[i][j]) for j, pdg in enumerate(im_pdgs)}
+                vt = build_process_virtuality(pd, [int(x) for x in slot_pdgs], n_initial,
+                                              mass_override=mo, offshell=bool(scanned_mass))
+                virt.append(vt)
+                n_virt += int(vt is not None)
+            self._diag_virt_by_pid = virt
+            LOGGER.info(f"Diagram virtuality (Tier B): built per-event maps for "
+                        f"{n_virt}/{len(pd_by_pid)} processes")
+        if missing:
+            LOGGER.warning(
+                f"Diagram conditioning: no sidecar for {missing} (zero embedding "
+                f"used). Generate via `python tools/dump_diagrams.py --all`.")
+        n_ok = sum(p is not None for p in pd_by_pid)
+        LOGGER.info(
+            f"Diagram conditioning: loaded graphs for {n_ok}/{len(names)} processes "
+            f"from {diagrams_dir} (f_node={self._diag_feature_dims[0]}, "
+            f"f_edge={self._diag_feature_dims[1]}, k_pe={k_pe})")
+
+    def _post_instantiate_model(self, model):
+        """Called on the instantiated model after construction.
+        Adds particle_encoder. Since the μP backbone computes its own base shapes in
+        __init__, particle_encoder is added outside that scope and is later marked as a
+        standard-parametrization (SP) parameter by lloca.mup.finalize (in init_model)."""
+        if self.modelname in ("LLOCATransformer", "LLOCAMuPTransformer", "MuPLGATr", "MuPLGATrSlim"):
+            use_pids = self.cfg.data.get("use_PIDs", False)
+            if getattr(model, "input_asym_factor", False):   # the target's std in nats (wrappers._asym_mu)
+                sds = np.atleast_1d(np.asarray(self.prepd_std, dtype=np.float64)).ravel()
+                assert np.allclose(sds, sds[0]), f"model.input_asym_factor needs one target std, got {sds}"
+                # per-dataset transforms when resolved per pool (the global one is then only representative: signedlog
+                # as soon as one pool changes sign), else the global one
+                trafos = ([list(t) for t in self._amp_trafos_pp] if getattr(self, "_amp_trafos_pp", None)
+                          else [list(self.cfg.data.amp_trafos)])
+                # a sign-changing pool under training.sign_head takes abslog:<s>, log max(|M|^2, s): the same natural
+                # log away from the zeros (the singular limits included), its sign from the sign row (D572)
+                ok = lambda t: t[0] == "log" or (getattr(self, "_sign_head", False) and str(t[0]).startswith("abslog:"))
+                assert all(ok(t) for t in trafos) and not self.cfg.data.get("target_physics_factor", False) \
+                    and not self.cfg.data.get("target_over_born", False), \
+                    f"model.input_asym_factor models log|M|^2 (natural log, no divided-out factor; abslog with " \
+                    f"training.sign_head), got trafos {trafos}"
+                model.asym_sd.fill_(float(sds[0]))
+            model.setup_particle_features(
+                use_pids=use_pids,
+                property_matrix=getattr(self, "property_matrix", None),
+                encoder_hidden=self.cfg.model.get("particle_encoder_hidden", 0),
+            )
+            # Data-derived per-particle on-shell mass (replaces the frozen
+            # log10_mass_gev table column with m=sqrt(E^2-|p|^2) per particle).
+            if self.cfg.data.get("mass_from_momenta", False):
+                assert not use_pids, (
+                    "data.mass_from_momenta requires the property encoding "
+                    "(use_PIDs=false)"
+                )
+                assert self.mom_div is not None, (
+                    "data.mass_from_momenta needs a single global momentum scale; "
+                    "use the recipe data path or a single-dataset run."
+                )
+                from particle_ids import mass_feature_spec
+                spec = mass_feature_spec(
+                    spin_onehot=self.cfg.data.get("spin_onehot", False),
+                    color_onehot=self.cfg.data.get("color_onehot", False),
+                    is_massless=self.cfg.data.get("prop_is_massless", False),
+                    standardize=self.cfg.data.get("standardize_props", False),
+                    generation_onehot=bool(self.cfg.data.get("generation_onehot", False)),
+                    generation_feature=bool(self.cfg.data.get("generation_feature", True)),
+                )
+                model.setup_mass_from_momenta(self.mom_div, spec)
+                LOGGER.info(
+                    f"Mass encoding: data-derived on-shell mass (mom_div={self.mom_div:.4g}, "
+                    f"mass_col={spec['mass_col']}, replaces frozen table mass)"
+                )
+            # data.dimensionless_inputs: masses as log10(m / sqrt(s_hat)) per event (wrappers.setup_dimless_mass)
+            if self.cfg.data.get("dimensionless_inputs", False) and use_pids:
+                # one-hot PIDs carry no mass column: the momenta and off-shellness are per sqrt(s_hat) as with the
+                # property encoding, and the wrapper only takes the log10 sqrt(s_hat) column off the order features
+                assert self.modelname == "LLOCAMuPTransformer", "use_PIDs with dimensionless_inputs: LLoCa only"
+                model.setup_dimless_pids()
+                LOGGER.info("dimensionless_inputs under use_PIDs: no mass column; log10 sqrt(s_hat) column dropped")
+            elif self.cfg.data.get("dimensionless_inputs", False):
+                assert not self.cfg.data.get("mass_from_momenta", False), \
+                    "data.dimensionless_inputs sets the mass column itself; data.mass_from_momenta must be off"
+                from particle_ids import mass_feature_spec, GLOBAL_PROPERTY_MATRIX, PARTICLE_FEATURE_NAMES, \
+                    MASS_MASSLESS_LOG10_THR
+                spec = mass_feature_spec(
+                    spin_onehot=self.cfg.data.get("spin_onehot", False),
+                    color_onehot=self.cfg.data.get("color_onehot", False),
+                    is_massless=self.cfg.data.get("prop_is_massless", False),
+                    standardize=self.cfg.data.get("standardize_props", False),
+                    generation_onehot=bool(self.cfg.data.get("generation_onehot", False)),
+                    generation_feature=bool(self.cfg.data.get("generation_feature", True)),
+                )
+                # the column transforms keep the rows, so the raw table's mass column marks the massive rows
+                raw_m = np.asarray(GLOBAL_PROPERTY_MATRIX)[:, PARTICLE_FEATURE_NAMES.index("log10_mass_gev")]
+                assert raw_m.shape[0] == self.property_matrix.shape[0], (raw_m.shape, self.property_matrix.shape)
+                massive = raw_m >= MASS_MASSLESS_LOG10_THR
+                massive[0] = False                     # row 0: the padding entry
+                mu_d, sd_d = self._dimless_mass_stats
+                std_on = bool(self.cfg.data.get("standardize_props", False))
+                # massless rows: the mean of the massive ones, as the GeV column's is_massless neutralisation does;
+                # the massive values are centred on mu_d in both modes, so that mean is 0
+                model.setup_dimless_mass(spec["mass_col"], raw_m, massive, mu_d, sd_d if std_on else 1.0, 0.0)
+                LOGGER.info(f"Mass encoding: log10(m / sqrt(s_hat)) per event for {int(massive.sum())} massive "
+                            f"species (dimensionless_inputs), mass_col={spec['mass_col']}, "
+                            f"{'z-scored' if std_on else 'raw'} on mean {mu_d:.3f}, std {sd_d:.3f}")
+            # model.context_dim (D105): a per-process context vector added to every particle's encoded
+            # properties (wrappers.setup_context); a real parameter, marked SP by mup_finalize like the encoder
+            if int(self.cfg.model.get("context_dim", 0) or 0):
+                assert self.modelname == "LLOCAMuPTransformer", "model.context_dim is implemented on the LLoCa wrapper"
+                names = self._context_names()
+                model.setup_context(names, int(self.cfg.model.context_dim),
+                                    float(self.cfg.model.get("context_dropout", 0.5)), list(self.cfg.data.dataset))
+                LOGGER.info(f"Context vector: {len(names)} table rows x {int(self.cfg.model.context_dim)}, dropout "
+                            f"{model.context_dropout}; {int((model._ctx_row >= 0).sum())} of this run's "
+                            f"{len(self.cfg.data.dataset)} processes have a row")
+            # Build + attach the diagram graph encoder (a real submodule → trained,
+            # checkpointed, marked SP by mup_finalize). Done here, like particle_encoder,
+            # so it exists before μP finalisation and warm-start loading.
+            if getattr(self, "_use_diagrams", False) and \
+                    getattr(self, "_diag_impl", "ours") == "llm4lhc":
+                from models.diagram_encoder_llm4lhc import LLM4LHCDiagramEncoder
+                cfg = self.cfg.model.get("diagram_encoder_llm4lhc", {}) or {}
+                encoder = LLM4LHCDiagramEncoder(
+                    self._diag_set_llm4lhc,
+                    out_dim=int(model.net.net.hidden_channels),
+                    hidden_size=int(cfg.get("hidden_size", 256)),
+                    num_layers=int(cfg.get("num_layers", 3)),
+                    num_heads=int(cfg.get("num_heads", 4)),
+                    laplacian_pe_dim=int(cfg.get("laplacian_pe_dim", 8)),
+                    dropout=float(cfg.get("dropout", 0.0)),
+                    mode=str(cfg.get("mode", "pooled")),
+                    edge_feature_mode=str(cfg.get("edge_feature_mode", "bias_kv")),
+                    virtuality_pool=bool(cfg.get("virtuality_pool", False)),
+                    virtuality_eps=float(cfg.get("virtuality_eps", 1e-6)),
+                )
+                encoder.mom_div = float(self.mom_div or 1.0)   # model momenta x mom_div = GeV (without dimensionless inputs)
+                model.setup_diagram_conditioning_llm4lhc(encoder)
+                LOGGER.info(f"Diagram encoder (llm4lhc): "
+                            f"{sum(p.numel() for p in encoder.parameters())} parameters, "
+                            f"out_dim={encoder.out_dim}")
+            elif getattr(self, "_use_diagrams", False):
+                from models.diagram_encoder import DiagramEncoder
+                f_node, f_edge = self._diag_feature_dims
+                enc_cfg = self.cfg.model.get("diagram_encoder", {}) or {}
+                # Tier B "edge" mode adds one per-event graph edge feature (the
+                # virtuality); "pool" mode feeds virtuality only into the pooling, so
+                # the graph encoder needs no extra edge channel.
+                _virt_mode = str(self.cfg.model.get("virt_mode", "edge"))
+                f_edge_extra = 1 if (getattr(self, "_use_diag_virt", False)
+                                     and _virt_mode == "edge") else 0
+                encoder = DiagramEncoder(
+                    f_node=f_node, f_edge=f_edge, k_pe=self._diag_k_pe,
+                    d_model=int(enc_cfg.get("d_model", 64)),
+                    n_heads=int(enc_cfg.get("n_heads", 4)),
+                    n_layers=int(enc_cfg.get("n_layers", 3)),
+                    d_out=self._d_diag, f_edge_extra=f_edge_extra,
+                )
+                model.setup_diagram_conditioning(encoder, self._diag_pd_by_pid, self._d_diag)
+            # Pairwise attention bias: attach the propagator specs + zero-init head
+            # (a real submodule → trained, checkpointed, marked SP by mup_finalize).
+            if getattr(self, "_use_pair_bias", False) and \
+                    any(s is not None for s in getattr(self, "_pair_bias_specs", [])):
+                model.setup_pair_bias(
+                    self._pair_bias_specs,
+                    num_heads=int(self.cfg.model.net.num_heads),
+                    hidden=int(self.cfg.model.get("pair_bias_hidden", 16)),
+                    clamp=float(self.cfg.model.get("pair_bias_clamp", 4.0)),
+                    mom_div=float(self.mom_div or 1.0),
+                    logit_cap=float(self.cfg.model.get("pair_bias_logit_cap", 8.0)),
+                )
+                LOGGER.info("pair_bias: ON — per-pair off-shellness attention bias "
+                            f"(H={int(self.cfg.model.net.num_heads)}, zero-init head)")
+            if getattr(self, "_use_diagrams", False) and \
+                    getattr(self, "_diag_impl", "ours") == "ours":
+                if getattr(self, "_use_diag_virt", False):
+                    model.setup_diagram_virtuality(
+                        self._diag_virt_by_pid,
+                        log_scale=float(self.cfg.model.get("virt_log_scale", 0.1)),
+                        standardize=bool(self.cfg.model.get("virt_standardize", True)),
+                        clamp=float(self.cfg.model.get("virt_clamp", 4.0)),
+                        mode=_virt_mode,
+                        mom_div=float(self.mom_div or 1.0))
+
+    def _freeze_all_but_sigma_head(self):
+        """Stage 2 of the two-stage HETEROSC recipe: train ONLY the σ rows of the readout.
+
+        The trunk and the μ row come from a converged plain-MSE run (grown to a 2-channel
+        readout by analysis/divergences/grow_sigma_head.py) and stay frozen bit-for-bit, so μ
+        is exactly the MSE model's μ and val μ-MSE is constant by construction. That removes
+        BOTH failure modes at once: there is no (μ,σ) multi-task competition for the shared
+        trunk, and — at β=0 — the Gaussian NLL is a proper scoring rule for σ (its only
+        stationary point is σ=|r|; the β>0 spurious optimum at r*=exp(-½-1/(2β)) is a statement
+        about μ, which is no longer free).
+
+        linear_out.weight/bias are single tensors holding BOTH heads, so the μ rows cannot be
+        frozen via requires_grad; a grad hook zeroes them instead (this also stops the L2
+        regularization term from decaying the μ row, since reg reaches params through the same
+        .grad).
+        """
+        k = int(self.cfg.model.net.out_channels)
+        lin = self.model.net.net.linear_out
+
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+
+        def _zero_mu_rows(grad):
+            # every row but the last k (sigma): mu, and the sign row under sign_channel (rows [mu, sign, sigma])
+            grad = grad.clone()
+            grad[:-k] = 0.0
+            return grad
+
+        for p in (lin.weight, lin.bias):
+            if p is None:
+                continue
+            p.requires_grad_(True)
+            p.register_hook(_zero_mu_rows)
+
+        n_train = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        LOGGER.info(
+            f"HETEROSC σ-only: trunk + μ head frozen; {n_train} readout params trainable, "
+            f"rows [:-{k}] (μ, and the sign row if any) grad-zeroed → only σ trains."
+        )
+
+    def _context_names(self):
+        """The context table's processes (model.context_dim): model.context_names_file if set, else the
+        context_names.json of the run fine_tune.pretrained_path comes from (a probe or fine-tune reads its parent's
+        table), else this run's own processes. The list is written to <run_dir>/context_names.json either way, so a
+        run started from this one (the sigma stage, a probe) finds it next to its checkpoint."""
+        f = self.cfg.model.get("context_names_file", None)
+        ft = (self.cfg.get("fine_tune", None) or {}).get("pretrained_path", None)
+        if not f and ft:
+            cand = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(str(ft)))), "context_names.json")
+            f = cand if os.path.exists(cand) else None
+            assert f, f"model.context_dim is on but the parent of {ft} has no context_names.json"
+        if f:
+            with open(str(f)) as fh:
+                names = [str(n) for n in json.load(fh)]
+        else:
+            names = [str(n) for n in self.cfg.data.dataset]
+        os.makedirs(self.cfg.run_dir, exist_ok=True)
+        with open(os.path.join(self.cfg.run_dir, "context_names.json"), "w") as fh:
+            json.dump(names, fh)
+        return names
+
+    def init_model(self):
+        super().init_model()  # _post_instantiate_model is called inside for all three models
+
+        if (self.cfg.training.loss == "HETEROSC"
+                and bool(self.cfg.training.get("heterosc_sigma_only", False))):
+            self._freeze_all_but_sigma_head()
+
+        ft = self.cfg.get("fine_tune", None)
+        if ft is None or ft.get("pretrained_path", None) is None:
+            return
+
+        self._load_pretrained_weights(
+            ft.pretrained_path,
+            reset_output_head=ft.get("reset_output_head", False),
+        )
+
+        if ft.lora.get("enabled", False):
+            from fine_tune import inject_lora
+            inject_lora(
+                self.model,
+                rank=ft.lora.rank,
+                alpha=ft.lora.alpha,
+                target=list(ft.lora.target),
+            )
+
+        freeze_blocks = list(ft.get("freeze_blocks", []))
+        if freeze_blocks:
+            for idx in freeze_blocks:
+                for p in self.model.net.net.blocks[idx].parameters():
+                    p.requires_grad_(False)
+            LOGGER.info(f"Fine-tuning: froze transformer blocks {freeze_blocks}")
+
+    def _init_ewc(self):
+        ft = self.cfg.get("fine_tune", None)
+        # linear probe, then fine-tune (D120): the head fitted on the frozen trunk before the optimizer is built
+        if ft is not None and ft.get("pretrained_path", None) and ft.get("linear_probe", False):
+            from fine_tune import linear_probe_head
+            linear_probe_head(self)
+        if ft is None or not ft.ewc.get("enabled", False):
+            self.ewc = None
+            return
+        from fine_tune import EWC
+        loss_fn = lambda batch: self._batch_loss(batch)[0]
+        self.ewc = EWC(
+            self.model,
+            self.train_loader,
+            n_fisher_batches=ft.ewc.get("n_fisher_batches", 64),
+            device=self.device,
+            loss_fn=loss_fn,
+            fisher_path=ft.ewc.get("fisher_path", None),
+            uniform=bool(ft.ewc.get("uniform", False)),
+        )
+        LOGGER.info(f"Fine-tuning: EWC initialized (lambda={ft.ewc.get('lambda', 1000.0)})")
+
+    def _init_data_recipes(self):
+        """Recipe-based data path: materialize explicit per-role pools
+        (train / frozen val / frozen test) from the `data.processes` spec, build
+        the combined flat arrays, and normalize using train-only statistics that
+        are frozen and saved to the run dir (reloaded on warm start rather than
+        recomputed)."""
+        import datagen
+        from particle_ids import global_encode, species_pdgs
+        from dataset import build_flat_arrays
+
+        assert self.modelname in (
+            "LLOCATransformer", "LLOCAMuPTransformer", "MuPLGATr", "MuPLGATrSlim"
+        ), "data.source=recipes is only supported for the LLoCa μP model"
+
+        specs     = self._recipe_specs
+        names     = [s["name"] for s in specs]
+        seed      = int(self.cfg.data.get("seed", 42))
+        use_pids  = self.cfg.data.get("use_PIDs", False)
+        roles     = ("train", "val", "test")
+        count_key = {"train": "n_train", "val": "n_val", "test": "n_test"}
+
+        # --- materialize the three role pools (frozen val/test, cached train) ---
+        # require_cache (default true on the recipe path) means a GPU training job
+        # never generates data inline — it expects the prebuild job
+        # (prebuild_recipes.sh) to have populated the cache, and fails fast
+        # otherwise rather than burning GPU time. Set data.require_cache=false to
+        # allow inline generation (e.g. a quick local run).
+        require_cache = bool(self.cfg.data.get("require_cache", True))
+        paths = {}
+        for role in roles:
+            role_specs = [{
+                "process":   s["name"],
+                "sqrts_min": s["sqrts_min"],
+                "sqrts_max": s["sqrts_max"],
+                "n_events":  s[count_key[role]],
+            } for s in specs]
+            paths[role] = datagen.ensure_split_set(
+                role_specs, role=role, seed=seed, require_cache=require_cache)
+        self._pool_paths = paths     # {role: {name: npy}}: what a probe read checks the physics of (tools/pool_physics.py)
+        mixed = datagen.mixed_generation(paths)
+        if mixed:
+            msg = (f"{len(mixed)} process(es) have train/val/test pools from different generator versions "
+                   f"and labels shifted between them (median ln|M|^2 train - other, combined z): {mixed}")
+            assert bool(self.cfg.data.get("allow_mixed_generation", False)), \
+                msg + "; regenerate the odd pool, or pass ++data.allow_mixed_generation=true to train on them anyway"
+            LOGGER.warning(msg + " (data.allow_mixed_generation=true)")
+        # a pool composed at load (mix_compose.py) carries its stored pool's recipe id, its sidecar sits in the job's
+        # $TMPDIR: which pools were composed, from which control pool, is written into the run's own record
+        composed = datagen.composed_record(paths)
+        if composed and self.cfg.get("run_dir"):
+            os.makedirs(self.cfg.run_dir, exist_ok=True)
+            with open(os.path.join(self.cfg.run_dir, "composed_pools.json"), "w") as fh:
+                json.dump(composed, fh, indent=1, sort_keys=True)
+            LOGGER.info(f"composed at load: {sum(len(v) for v in composed.values())} pools "
+                        f"({ {r: len(v) for r, v in composed.items()} }), recorded in composed_pools.json")
+
+        # --- frozen normalization stats (all GLOBAL scalars, train-only) ---
+        # Source of truth, in priority order:
+        #   1. warm-start resume  -> this run's own data_stats.json
+        #   2. fine-tune          -> the pretrained run's data_stats.json, so the
+        #                            backbone keeps seeing inputs in its training
+        #                            normalization (mirrors the tokenizer reuse)
+        #   3. otherwise          -> compute fresh from train below
+        stats_path = os.path.join(self.cfg.run_dir, "data_stats.json")
+        ft         = self.cfg.get("fine_tune", None)
+        ft_path    = ft.get("pretrained_path", None) if ft is not None else None
+        stats_src  = None
+        if self.warm_start and os.path.exists(stats_path):
+            stats_src = stats_path
+        elif ft_path is not None:
+            cand = os.path.join(os.path.dirname(os.path.dirname(ft_path)),
+                                "data_stats.json")
+            if os.path.exists(cand):
+                stats_src = cand
+
+        # Amplitude preprocessing scope: global (single train-only scale, keeps
+        # the relative magnitude differences between processes) vs per-dataset
+        # (each process normalized to unit scale independently). Controlled by
+        # data.preprocess_per_dataset (default False = global).
+        per_dataset = bool(self.cfg.data.get("preprocess_per_dataset", False))
+
+        _dms_frozen = None   # dimensionless_inputs: the mass column's (mean, std), the parent's when stats are frozen
+        _cp_frozen = None    # target_physics_hybrid: the constants c_p the frozen stats carry (a parent's, a resumed run's)
+        if stats_src is not None:
+            with open(stats_src) as f:
+                stats = json.load(f)
+            _dms_frozen = stats.get("dimless_mass_stats")
+            if ft_path is not None and not self.warm_start and str(ft.get("mass_stats", "parent")) == "own":
+                _dms_frozen = None   # fine_tune.mass_stats=own: the mass column refit on this run's train pools
+            _cp_frozen = stats.get("target_physics_hybrid_cp")
+            mom_div    = float(stats["mom_div"])
+            mom_mean   = float(stats["mom_mean"])
+            mom_std    = float(stats["mom_std"])
+            amp_trafos = stats["amp_trafos"]
+            # per-process transforms (per-dataset scope): a positive pool keeps `log`,
+            # a signed one carries `signedlog:<s>` with its own scale, so they must be
+            # reloaded with the stats, not re-resolved from whatever data is present.
+            amp_trafos_pp = stats.get("amp_trafos_pp")
+            # prepd_mean/std stored as a list: length 1 (global) or n_proc
+            # (per-dataset, aligned with data.dataset order).
+            prepd_means = [float(x) for x in np.atleast_1d(np.asarray(stats["prepd_mean"], dtype=np.float64))]
+            prepd_stds  = [float(x) for x in np.atleast_1d(np.asarray(stats["prepd_std"],  dtype=np.float64))]
+            per_dataset = bool(stats.get("preprocess_per_dataset", len(prepd_means) > 1))
+            # a fine-tune with fine_tune.target_stats=own refits the whole target transform on its own train split
+            # (below), so only the momentum-side checks apply to the parent's stats
+            _own = (ft_path is not None and not self.warm_start
+                    and str(ft.get("target_stats", "parent")) == "own")
+            # the target factor (data.target_propagators) is part of the target these stats
+            # were fitted on: a mismatch would rescale the target under the parent's
+            # standardization without a trace
+            _pf_stats = bool(stats.get("target_physics_factor", False))
+            _pf_cfg = bool(self.cfg.data.get("target_physics_factor", False))
+            assert _own or _pf_stats == _pf_cfg, (f"frozen data stats were fitted with target_physics_factor={_pf_stats}, "
+                                          f"this run sets {_pf_cfg}")
+            # the factor's parameters too, when it is on: each one shifts the target by a per-N constant
+            # ((4-N) log s0, (4-N) log of the reference) that the parent's standardization would hide
+            if _pf_cfg and not _own:
+                for _k, _d in (("target_physics_dim_only", False), ("target_physics_eikonal", False), ("target_physics_orders", False),
+                               ("target_physics_hybrid", False), ("target_physics_hybrid_blend", 0.0),
+                               ("target_physics_s0", 289.0),
+                               ("target_physics_dim_ref", "shat"), ("target_physics_couplings", None),
+                               ("target_physics_alpha_inv", 132.507)):
+                    # stats written before the key were fitted at its default
+                    _a, _b = stats.get(_k, _d), self.cfg.data.get(_k, _d)
+                    _same = (abs(float(_a) - float(_b)) < 1e-9 * max(1.0, abs(float(_a)))
+                             if _k in ("target_physics_s0", "target_physics_alpha_inv", "target_physics_hybrid_blend")
+                             else str(_a) == str(_b))
+                    assert _same, f"frozen data stats were fitted with {_k}={_a}, this run sets {_b}"
+                self._check_frozen_orders_source(stats, os.path.dirname(os.path.abspath(stats_src)))
+            # the momentum scale of these stats is in GeV or in units of each event's sqrt(s_hat)
+            _di_stats = bool(stats.get("dimensionless_inputs", False))
+            _di_cfg = bool(self.cfg.data.get("dimensionless_inputs", False))
+            assert _di_stats == _di_cfg, (f"frozen data stats were fitted with dimensionless_inputs={_di_stats}, "
+                                          f"this run sets {_di_cfg}")
+            _vb_stats = bool(stats.get("target_over_born", False))
+            _vb_cfg = bool(self.cfg.data.get("target_over_born", False))
+            assert _own or _vb_stats == _vb_cfg, (f"frozen data stats were fitted with target_over_born={_vb_stats}, "
+                                          f"this run sets {_vb_cfg}")
+            _tp_stats = bool(stats.get("target_propagators", False))
+            _tp_cfg = bool(self.cfg.data.get("target_propagators", False))
+            assert _own or _tp_stats == _tp_cfg, (
+                f"frozen data stats were fitted with target_propagators={_tp_stats}, "
+                f"this run sets {_tp_cfg}")
+            # the signed-log scale's shift (stats written before the key were fitted without one): a mismatch would
+            # read the frozen signedlog strings under one convention and refit a probe's own under another
+            _ss_stats = float(stats.get("signedlog_scale_shift", 0.0) or 0.0)
+            assert _own or abs(_ss_stats - self._signedlog_scale_shift()) < 1e-12, (
+                f"frozen data stats were fitted with signedlog_scale_shift={_ss_stats}, "
+                f"this run sets {self._signedlog_scale_shift()}")
+            LOGGER.info(f"Loaded frozen data stats from {stats_src}")
+            if ft_path is not None and not self.warm_start:
+                # the off-shellness input's column stats, kept so the backbone reads a propagator's
+                # off-shellness on the scale it was pretrained on (fine_tune.offshell_stats)
+                _po = ft.get("parent_offshell_stats", None)
+                self._parent_offshell = stats.get("offshell_stats") or (
+                    OmegaConf.to_container(_po) if _po is not None else None)
+            if ft_path is not None and not self.warm_start \
+                    and str(ft.get("target_stats", "parent")) == "own":
+                # fine-tune onto a process the parent never standardized: keep the parent's
+                # momentum scale (the backbone's inputs), fit the target's own amplitude
+                # transform and mean/std on this run's train split, as a scratch run does
+                amp_trafos = amp_trafos_pp = None
+                prepd_means = prepd_stds = None
+                per_dataset = bool(self.cfg.data.get("preprocess_per_dataset", False))
+                LOGGER.info("Fine-tuning: amplitude stats fitted on this run's train split "
+                            "(fine_tune.target_stats=own); momentum stats from the parent")
+            if ft_path is not None and not self.warm_start \
+                    and str(ft.get("target_stats", "parent")) == "parent_shared":
+                # fine-tune onto a process the parent never saw, keeping the parent's target standardization: the
+                # probe's own transform (log, or signedlog for a signed pool, resolved as a fresh run does) and the
+                # parent's pooled (mu, sigma) (or its mu_N = a + b N), so the loss at step 0 is the parent's zero-shot
+                # (tools/zero_shot_parent.py reads it with the same statistics, multiplicity_extrap.parent_target_standardization)
+                amp_trafos = amp_trafos_pp = None
+                prepd_means = prepd_stds = None
+                per_dataset = bool(self.cfg.data.get("preprocess_per_dataset", False))
+                # the memmap path too: its cache holds no target statistic (data_mmap.base_key_doc), and it standardizes
+                # at open through _resolve_amp_preprocessing, which applies these (llm_compare's held-out read)
+                self._ft_parent_target_stats = stats
+                LOGGER.info("Fine-tuning: the parent's target standardization kept on the probe "
+                            "(fine_tune.target_stats=parent_shared), transform resolved on its own train split")
+        else:
+            mom_div = mom_mean = mom_std = None
+            amp_trafos = None
+            amp_trafos_pp = None
+            prepd_means = prepd_stds = None
+
+        amp_orders       = self._resolve_amp_orders(self.cfg.data.dataset)
+        n_order_features = len(self._order_row(0, amp_orders))
+
+        # Per-dataset load caps: the frozen pools can hold far more than a single
+        # run trains on (e.g. 10M/process), so only `train_subsample` train events
+        # and `eval_subsample` val/test events per process are pulled into memory
+        # (mmap slice — the full file is never read). None = load all.
+        train_cap = self.cfg.data.get("train_subsample", None)
+        eval_cap  = self.cfg.data.get("eval_subsample", None)
+        # data.phase_space_on_pool: what depends on the momenta alone (the momentum scale,
+        # which propagator factors the target divides out and their t-channel scale) is
+        # fitted on the whole train pool, whose phase-space points cost nothing without
+        # their amplitudes; the train split is then cut to its first `train_subsample`
+        # events, and everything that reads an amplitude (transform, mean/std) is fitted on
+        # those alone. A data-scaling grid over train_subsample then trains every cell on
+        # one target, and its loss converts to one unit (MSE of log|M|^2 = the
+        # standardized loss times prepd_std^2) without any cell seeing extra labels.
+        stats_on_pool = bool(self.cfg.data.get("phase_space_on_pool", False)) \
+            and train_cap not in (None, "null", "none")
+        train_keep = int(train_cap) if stats_on_pool else None
+        if stats_on_pool:
+            train_cap = None
+        cap_for   = {"train": train_cap, "val": eval_cap, "test": eval_cap}
+
+        if bool(self.cfg.data.get("memmap", False)):
+            assert not bool(self.cfg.data.get("target_over_born", False)), \
+                "data.target_over_born is built on the in-memory path (data.memmap=false)"
+            assert not bool(self.cfg.data.get("target_times_beta", False)), \
+                "data.target_times_beta is built on the in-memory path (data.memmap=false)"
+            # host memory that scales with the batch: the same arrays, built once per input set into
+            # memory-mapped files and gathered by index (data_mmap.py)
+            assert self._mom_np_dtype() == np.float32, ("data.memmap gathers float32 momenta (data_mmap.py); a "
+                                                        "training.dtype=float64 run uses the in-memory path")
+            from data_mmap import init_data_recipes_mmap
+            assert float(self.cfg.training.get("sign_near_weight", 1.0) or 1.0) <= 1, \
+                "training.sign_near_weight is built on the in-memory path only (data.memmap=false)"
+            init_data_recipes_mmap(self, dict(
+                specs=specs, names=names, roles=roles, paths=paths, use_pids=use_pids, per_dataset=per_dataset,
+                mom_div=mom_div, mom_mean=mom_mean, mom_std=mom_std, amp_trafos=amp_trafos,
+                amp_trafos_pp=amp_trafos_pp, prepd_means=prepd_means, prepd_stds=prepd_stds,
+                amp_orders=amp_orders, n_order_features=n_order_features, cap_for=cap_for,
+                stats_on_pool=stats_on_pool, dimless_mass_stats=_dms_frozen))
+            if self.cfg.save and not os.path.exists(stats_path):
+                self._save_data_stats(stats_path, self.mom_div, self.cfg.data.amp_trafos, per_dataset)
+            self._finalize_data_sizing()
+            return
+
+        # --- load every (role, process); boost+augment momenta (no scale yet) ---
+        store = {}
+        _porder = str(self.cfg.data.get("particle_order", "none"))
+        _porder_rng = np.random.default_rng(int(self.cfg.data.get("seed", 42))) if _porder == "shuffle" else None
+        if _porder != "none":
+            LOGGER.info(f"particle_order={_porder}: identical outgoing particles ordered "
+                        f"{'by p.P descending' if _porder == 'pdotP' else 'at random'} (multiplicity_extrap)")
+        for role in roles:
+            cap = cap_for[role]
+            cap = int(cap) if cap not in (None, "null", "none") else None
+            for s in specs:
+                name = s["name"]
+                if cap is not None:
+                    data_raw = np.asarray(np.load(paths[role][name], mmap_mode="r")[:cap])
+                else:
+                    data_raw = np.load(paths[role][name])
+                LOGGER.info(
+                    f"  [{role}] {name}: {data_raw.shape[0]} events"
+                    f"{f' (cap {cap})' if cap else ''} from {paths[role][name]}"
+                )
+                n_particles  = (data_raw.shape[1] - 1) // 5
+                momenta_cols = n_particles * 4
+                particles  = data_raw[:, :momenta_cols]
+                pdg_ids    = data_raw[:, momenta_cols:-1].astype(int)
+                amplitudes = data_raw[:, [-1]]
+                if bool(self.cfg.data.get("target_over_born", False)):
+                    # the one-loop virtual over its exact Born, event by event (plan virtual_over_born, D366; the KIT NLO
+                    # protocol's V/B baseline): the Born is MadLoop's |M0|^2 on the same row, kept as the row-aligned
+                    # sidecar <pool>.born.npy (tools/nlo_virtual_pipeline.born_path). Every relative error (log-space MSE,
+                    # |pred/true - 1|) of V/B is that of the recombined V = (V/B) B, B being exact.
+                    amplitudes = amplitudes / self._born_of_pool(paths[role][name], amplitudes.shape[0])
+                if bool(self.cfg.data.get("target_times_beta", False)):
+                    # kit_benchmark step 6 (Coulomb rise, target side): the one-loop virtual times the top pair's beta,
+                    # which removes its exact O(alpha_s) Coulomb term's 1/beta (V/B -> C_F alpha_s pi / (2 beta) at
+                    # threshold), so the target stays finite there; an exact per-event factor of the momenta, so
+                    # kit_predict's log-space residual is that of V itself
+                    amplitudes = amplitudes * pair_beta(particles, pdg_ids)[:, None]
+
+                if use_pids:
+                    toks = self.tokenizer.register_and_encode(pdg_ids)
+                else:
+                    toks = global_encode(species_pdgs(pdg_ids, s.get("physics"), recipe_process_cfg(s)))   # heavy-quark tops, massless b: their mass
+                    self.tokenizer.register_and_encode(pdg_ids)  # keep in sync
+
+                # Raw per-slot PDG order (fixed per process) for the Tier-B leg→slot map.
+                if not hasattr(self, "_slot_pdgs_by_name"):
+                    self._slot_pdgs_by_name = {}
+                self._slot_pdgs_by_name.setdefault(name, [int(x) for x in pdg_ids[0]])
+
+                if _porder != "none":
+                    # the causal mask's sequence order (multiplicity_extrap): identical outgoing particles
+                    # trade slots, by p.P descending or at random; set before anything reads the momenta
+                    particles = order_identical_particles(particles, pdg_ids, _porder, rng=_porder_rng)
+                com = self._boost_com(particles, n_particles)
+                # only the centre-of-mass momenta are kept (GeV): the frame-independent quantities read them, and the
+                # network's momenta (augmented, scaled) are made from them pool by pool at assembly (_model_momenta)
+                store[(role, name)] = {
+                    "role":    role,
+                    "com":     com,
+                    "uid":     keyed_aug.pool_uid(pool_identity(paths[role][name])),
+                    "tokens":  toks,
+                    "raw_amp": amplitudes,
+                }
+                if bool(self.cfg.data.get("target_physics_orders", False)):
+                    assert bool(self.cfg.data.get("target_physics_factor", False)), \
+                        "data.target_physics_orders acts through the target factor: set data.target_physics_factor=true"
+                    # each event's own alpha_s, the one its |M|^2 was labelled at (lhe_pp: AQCDUP), stored next to the
+                    # pool as <pool>.alphas.npy (mg5_pipeline_final.build_lhe_pp; tools/recover_alphas.py for older pools)
+                    ap = paths[role][name][:-len(".npy")] + ".alphas.npy"
+                    if not os.path.exists(ap) and int(self._orders_of(name)[2]) == 0:
+                        # alpha_s power 0 (purely electroweak): the factor does not depend on alpha_s, so none is needed
+                        # (ten W+W-H-like catalog pools whose MadEvent rerun did not reproduce, 2026-10-23)
+                        a_s = np.ones(amplitudes.shape[0])
+                    else:
+                        assert os.path.exists(ap), f"data.target_physics_orders: no per-event alpha_s for {paths[role][name]}"
+                        a_s = np.load(ap, mmap_mode="r")
+                    store[(role, name)]["alphas"] = np.asarray(a_s[:cap] if cap is not None else a_s, dtype=np.float64)
+                    assert store[(role, name)]["alphas"].shape[0] == amplitudes.shape[0], (ap, a_s.shape, amplitudes.shape)
+
+        # --- single GLOBAL momentum scale, fit on TRAIN only (matches upstream
+        #     load_file: momentum /= momentum.std()), then applied to every block.
+        #     mom_mean/mom_std for the in-net (local-mean)/std are the global
+        #     stats of the scaled train momenta. ---
+        # data.dimensionless_inputs (2026-10-22, the user: the dimensionless path): every event's momenta in units of its
+        #     own sqrt(s_hat), s_hat = (p1 + p2)^2, before the global scale (then a pure number). rec["rs"] keeps
+        #     sqrt(s_hat) in GeV for what needs physical momenta (the target factors, the off-shellness) and for the
+        #     per-event mass feature log10(m / sqrt(s_hat)) (wrappers.setup_dimless_mass).
+        _dimless = bool(self.cfg.data.get("dimensionless_inputs", False))
+        if _dimless:
+            for k in store:
+                cm = store[k]["com"].astype(np.float64)       # s_hat is invariant: read in the centre-of-mass frame
+                q = cm[:, 0] + cm[:, 1]
+                rs = np.sqrt(q[:, 0] ** 2 - (q[:, 1:] ** 2).sum(axis=1))
+                assert np.all(rs > 0), f"dimensionless_inputs: non-positive s_hat in {k}"
+                store[k]["rs"] = rs
+                del cm, q
+            # the mass column log10(m / sqrt(s_hat)) is z-scored on its own statistics over the massive particles of
+            # the train pools (the GeV column's frozen statistics would put it far off centre: the top at -4, the b
+            # at -8 at sqrt(s_hat) = 1 TeV, and the massless neutral value above every massive one); frozen with the
+            # data stats, so a fine-tune or a held-out process reads the parent's
+            if self.cfg.data.get("use_PIDs", False):
+                # one-hot PIDs have no mass column (wrappers.setup_dimless_pids): no statistics, None is frozen
+                self._dimless_mass_stats = None
+            elif _dms_frozen is not None:
+                self._dimless_mass_stats = [float(_dms_frozen[0]), float(_dms_frozen[1])]
+            else:
+                from particle_ids import GLOBAL_PROPERTY_MATRIX, PARTICLE_FEATURE_NAMES, MASS_MASSLESS_LOG10_THR
+                raw_lm = np.asarray(GLOBAL_PROPERTY_MATRIX)[:, PARTICLE_FEATURE_NAMES.index("log10_mass_gev")]
+                n1 = s1 = s2 = 0.0
+                for n in names:
+                    rec = store[("train", n)]
+                    t = np.asarray(rec["tokens"]).reshape(rec["com"].shape[:2])
+                    v = (raw_lm[t] - np.log10(rec["rs"])[:, None])[(raw_lm[t] >= MASS_MASSLESS_LOG10_THR) & (t > 0)]
+                    n1 += v.size; s1 += float(v.sum()); s2 += float((v.astype(np.float64) ** 2).sum())
+                mu = s1 / n1 if n1 else 0.0
+                sd = float(np.sqrt(max(s2 / n1 - mu ** 2, 0.0))) if n1 else 1.0
+                self._dimless_mass_stats = [mu, sd if sd > 1e-6 else 1.0]
+            if self._dimless_mass_stats is None:
+                LOGGER.info("dimensionless_inputs under use_PIDs: no mass column, no mass statistics")
+            else:
+                LOGGER.info(f"dimensionless_inputs: log10(m / sqrt(s_hat)) over the massive train particles, mean "
+                            f"{self._dimless_mass_stats[0]:.3f}, std {self._dimless_mass_stats[1]:.3f}")
+        if mom_div is None:
+            # np.std / np.mean of the concatenated train momenta as the network reads them (augmented, per sqrt(s_hat)
+            # under dimensionless_inputs), streamed pool by pool in numpy's own summation order (data_mmap.f32_mean_std)
+            from data_mmap import f32_mean_std
+            def _train_mom():
+                for n in names:
+                    for a in self._model_momenta(store[("train", n)]):
+                        yield a.reshape(-1, 4)
+            _, sd = f32_mean_std(_train_mom)
+            mom_div  = float(sd)
+            m_, s_ = f32_mean_std(_train_mom, scale=mom_div)
+            mom_mean = float(m_)
+            mom_std  = float(max(s_, 1e-2))
+        self.mom_mean = [mom_mean]
+        self.mom_std  = [mom_std]
+        self.mom_div  = float(mom_div)   # physical scale (for data.mass_from_momenta)
+
+        def _phys(rec):
+            """(N, P, 4) momenta in GeV of a store record: its centre-of-mass momenta, before the augmentation and the
+            scales (every quantity read from them is Lorentz invariant)"""
+            return rec["com"].astype(np.float64)
+
+        # --- amplitude preprocessing: stats fitted on TRAIN, applied to all ---
+        # --- target-side propagator subtraction (data.target_propagators): every event's
+        #     |M|² is multiplied by Π_k ((s_k − M_k²)² + M_k²Γ_k²)/M_k⁴ over the process's
+        #     propagators carrying data.target_propagator_pdgs (massive; Breit–Wigner
+        #     denominators, the scanned mass where a scan sets it), so the log target is the
+        #     smooth remainder and the pole is no longer the network's to resolve. The
+        #     per-event factor is kept (self.all_amp_factor) and divided out of the raw
+        #     predictions at evaluation, so raw-space metrics and plots are on the true
+        #     |M|². The transform resolution, the signed-log scale and the standardization
+        #     all see the modified target. Same masks as the off-shellness input. ---
+        _tp_on = bool(self.cfg.data.get("target_propagators", False))
+        _phys_on = bool(self.cfg.data.get("target_physics_factor", False))
+        self._target_factor_on = _tp_on or _phys_on
+        if _tp_on:
+            tp_pdgs = [int(x) for x in (self.cfg.data.get("target_propagator_pdgs", []) or [])]
+            widths = {int(k): float(v) for k, v in
+                      dict(self.cfg.data.get("target_propagator_widths", {}) or {}).items()}
+            # a pool generated with its own width (recipe physics.widths: catalog_3's heavy-quark layer, the top width
+            # following m_t) takes that width in its Breit-Wigner, the configured one otherwise
+            _pool_widths = {sp["name"]: {abs(int(k)): float(v) for k, v in ((sp.get("physics") or {}).get("widths") or {}).items()}
+                            for sp in (getattr(self, "_recipe_specs", None) or [])}
+            # massless t-channel exchanges (data.target_propagator_tchannel): a massless
+            # propagator whose s_k is spacelike on the whole train pool is a t-channel
+            # exchange; |M|² goes like 1/|t| for a fermion and 1/t² for a boson, so the
+            # factor is (|t|/median|t|)^p with p = 1 or 2 (normalised to stay O(1)).
+            tch_on = bool(self.cfg.data.get("target_propagator_tchannel", False))
+            tch_max_final = int(self.cfg.data.get("target_propagator_tchannel_max_final", 99))
+            massless = [1, 2, 3, 4, 5, 11, 12, 13, 14, 15, 16, 21, 22] if tch_on else []
+            tp_masks = self._setup_offshell_masks(names, pdgs=tp_pdgs + massless)
+            n_ok, red_before, red_after, n_props, n_tch = 0, [], [], 0, 0
+            straddle = float(self.cfg.data.get("target_propagator_straddle", 0.005))
+            n_cand = 0
+            for proc_idx, name in enumerate(names):
+                sel = tp_masks[proc_idx] if tp_masks else None
+                cand = [(pdg, mrow, mm) for pdg, lst in (sel or {}).items() for mrow, mm in lst]
+                n_cand += len(cand)
+                # keep a massive propagator only if its pole is reached inside the pool: the
+                # train pool's s_k must straddle M² (a fraction of events on each side above
+                # `straddle`); a sub-system pole out of kinematic reach never straddles, and its
+                # factor would only add range. A massless one counts only as a t-channel
+                # exchange (s_k <= 0 on the whole pool); an s-channel massless propagator has
+                # no reachable pole.
+                props = []      # (pdg, mask, M², power, norm): massive -> BW, massless -> |t|^p
+                if cand and ("train", name) in store:
+                    pp = _phys(store[("train", name)])
+                    for pdg, mrow, mm in cand:
+                        q = np.einsum("s,nsc->nc", mrow, pp)
+                        s_prop = q[:, 0] ** 2 - (q[:, 1:] ** 2).sum(axis=1)
+                        if mm > 0:
+                            above = float(np.mean(s_prop > mm))
+                            if straddle < above < 1.0 - straddle:
+                                props.append((pdg, mrow, mm, 2.0, None))
+                        elif (tch_on and np.all(s_prop <= 1e-6 * np.abs(s_prop).max())
+                              and int(np.count_nonzero(mrow)) == 2 and mrow.min() < 0 < mrow.max()
+                              and pp.shape[1] - 2 <= tch_max_final):
+                            # the exchange between ONE initial and ONE final leg (the forward
+                            # peak); the other spacelike internal lines of a multi-leg process
+                            # are not poles the target reaches, and their factors only add range
+                            power = 1.0 if abs(int(pdg)) < 17 else 2.0
+                            # norm = (median |t|, floor): |t| is floored at the pool's 1e-3
+                            # quantile so the forward edge cannot put an outlier of tens of
+                            # units into the standardized target (one seed in three diverged
+                            # with a 1e-12 floor)
+                            at = np.abs(s_prop)
+                            pinned = self.cfg.data.get("target_propagator_tchannel_norm", None)
+                            assert pinned is None or len(names) == 1, \
+                                "data.target_propagator_tchannel_norm is one [median, floor] pair: single-process runs only"
+                            norm = ((float(pinned[0]), float(pinned[1])) if pinned is not None else
+                                    (float(np.median(at)) or 1.0, float(np.quantile(at, 1e-3)) or 1e-12))
+                            self._tch_norm = [float(norm[0]), float(norm[1])]
+                            LOGGER.info(f"t-channel factor {name}: median |t| {norm[0]:.6g}, floor {norm[1]:.6g}"
+                                        f"{' (pinned)' if pinned is not None else ''}")
+                            props.append((pdg, mrow, 0.0, power, norm))
+                            n_tch += 1
+                for role in roles:
+                    if (role, name) not in store:
+                        continue
+                    rec = store[(role, name)]
+                    pp = _phys(rec)                                             # (N,P,4) GeV
+                    logF = np.zeros(pp.shape[0], dtype=np.float64)
+                    for pdg, mrow, mm, power, norm in props:
+                        q = np.einsum("s,nsc->nc", mrow, pp)                   # (N,4) physical
+                        s_prop = q[:, 0] ** 2 - (q[:, 1:] ** 2).sum(axis=1)
+                        if mm > 0:
+                            g = _pool_widths.get(name, {}).get(abs(int(pdg)), widths.get(abs(int(pdg)), 0.0))
+                            logF += np.log(((s_prop - mm) ** 2 + mm * g ** 2) / (mm ** 2))
+                        else:
+                            med, floor = norm
+                            logF += power * np.log(np.maximum(np.abs(s_prop), floor) / med)
+                    F = np.exp(logF).reshape(rec["raw_amp"].shape)
+                    if role == "train" and props:
+                        pos = rec["raw_amp"] > 0
+                        if pos.sum() > 10:
+                            la = np.log(rec["raw_amp"][pos])
+                            red_before.append(float(np.ptp(la)))
+                            red_after.append(float(np.ptp(la + logF.reshape(rec["raw_amp"].shape)[pos])))
+                    rec["amp_factor"] = F
+                    rec["raw_amp"] = rec["raw_amp"] * F
+                if props:
+                    n_ok += 1; n_props += len(props)
+            LOGGER.info(f"target_propagators ON: {n_ok}/{len(names)} processes carry a factor "
+                        f"({n_props} of {n_cand} propagators reach their pole in the pool, of which "
+                        f"{n_tch} massless t-channel; pdgs {tp_pdgs}, widths {widths}); median range of "
+                        f"ln|M|² on the train pools {np.median(red_before) if red_before else float('nan'):.2f} "
+                        f"-> {np.median(red_after) if red_after else float('nan'):.2f}")
+        # --- the physics factor (data.target_physics_factor; 2026-10-22, D83, normalization A): every event's |M|^2 is
+        #     multiplied by (s0 / s_hat)^(4-N) / C_p, s_hat = (p1 + p2)^2 of the two incoming momenta, N the particle
+        #     count (the mass dimension 8 - 2N of |M|^2), C_p the coupling product of the process's leading tree diagram
+        #     (data.target_physics_couplings: analysis/catalog_pp/diagram_couplings.py), s0 one reference for the
+        #     whole catalog (data.target_physics_s0, GeV^2). It needs no data of the process, so a held-out process is
+        #     read with the same shared standardization. Kept in rec["amp_factor"] with any propagator factor and divided
+        #     out of the raw predictions at evaluation, like target_propagators. ---
+        if _phys_on:
+            spans = []
+            # data.target_physics_hybrid: one constant per process, c_p, shared by its roles. A process the frozen data
+            # stats carry a c_p for (a fine-tune's parent trained on it, a resumed run) keeps that one, the target the
+            # stats were fitted on; any other is fitted on its own momenta (its train events, a held-out probe's own
+            # train events too; val or test when a process has no train split)
+            self._phys_cp = {}
+            if bool(self.cfg.data.get("target_physics_hybrid", False)):
+                assert str(self.cfg.data.get("target_physics_dim_ref", "shat")) == "shat", \
+                    "target_physics_hybrid: the s_hat reference (target_physics_dim_ref=shat) plus the constant"
+                from physics_scales import hybrid_cps
+
+                def _cp_events(name):
+                    src = next(((r, name) for r in ("train", "val", "test") if (r, name) in store), None)
+                    assert src is not None, f"target_physics_hybrid: no events of {name} to fit its constant on"
+                    return _phys(store[src])
+                self._phys_cp, _cp_reused = hybrid_cps(names, _cp_events, frozen=_cp_frozen)
+                _cps = np.array(list(self._phys_cp.values()))
+                LOGGER.info(f"target_physics_hybrid ON: c_p for {len(_cps)} processes ({len(_cp_reused)} from the "
+                            f"frozen data stats), median {np.median(_cps):.3g}, "
+                            f"5-95% {np.percentile(_cps, 5):.3g} to {np.percentile(_cps, 95):.3g}")
+            for name in names:
+                for role in roles:
+                    if (role, name) not in store:
+                        continue
+                    rec = store[(role, name)]
+                    logF = self._physics_logF(name, _phys(rec), alphas=rec.get("alphas"))
+                    F = np.exp(logF).reshape(rec["raw_amp"].shape)
+                    if role == "train":
+                        spans.append(float(np.mean(logF)))
+                    rec["amp_factor"] = rec.get("amp_factor", np.ones_like(rec["raw_amp"])) * F
+                    rec["raw_amp"] = rec["raw_amp"] * F
+            LOGGER.info(f"target_physics_factor ON: {len(names)} processes, s0 = {np.exp(self._phys_ls0):.4g} GeV^2, "
+                        f"mean log F over the train pools: median {np.median(spans):.3g}, "
+                        f"5-95% {np.percentile(spans, 5):.3g} to {np.percentile(spans, 95):.3g}")
+        if train_keep is not None:
+            for n in names:
+                rec = store[("train", n)]
+                N = rec["raw_amp"].shape[0]
+                for key, val in list(rec.items()):
+                    if isinstance(val, np.ndarray) and val.shape[:1] == (N,):
+                        rec[key] = val[:train_keep]
+            LOGGER.info(f"phase_space_on_pool: momentum scale and target propagators fitted on the "
+                        f"full train pools' momenta, train split cut to the first {train_keep} "
+                        f"events per process before the amplitude statistics")
+
+        # The amp_trafos list (e.g. signedlog) is always resolved globally so the
+        # same transform is used for every process; only the standardization
+        # mean/std differ between the global and per-dataset scopes.
+        train_raw = np.concatenate(
+            [store[("train", n)]["raw_amp"] for n in names], axis=0
+        )
+        amp_trafos, prepd_means, prepd_stds = self._resolve_amp_preprocessing(
+            names, roles, lambda r, n: store[(r, n)]["raw_amp"] if (r, n) in store else None, train_raw,
+            lambda n: store[("train", n)]["com"].shape[1], per_dataset,
+            amp_trafos, amp_trafos_pp, prepd_means, prepd_stds)
+
+        # --- assemble combined flat arrays, role-contiguous (train|val|test) ---
+        # Vectorized per dataset (no per-event Python list), so this scales to
+        # millions of events. Within a (role, process) block every event has the
+        # same particle count P, so the boosted momenta (N,P,4) reshape directly
+        # to a flat (N*P,4) and offsets are built arithmetically. The flat
+        # particle arrays stay in dataset order; only the small per-event arrays
+        # (offsets / amp / pid / order) are shuffled (seed 42) to interleave
+        # processes for the balanced sampler — the offsets still index the right
+        # (unshuffled) particle ranges, so O(events) work touches only metadata.
+        role_particles, role_tokens, role_offsets = [], [], []
+        role_amp, role_pid, role_order = [], [], []
+        role_resarg = []   # per-event resonance arg (√s − m), when resonance_per_event
+        role_counts = {}
+        # each role's shuffle: position i of the role holds row _role_perm[role][i] of the role's
+        # concatenated pools (save_predictions writes it as pool_row)
+        self._role_perm = {}
+        # Production off-shellness feed (s_prop − M², direct) takes precedence over the
+        # s-channel √s−m diagnostic when both are on.
+        _want_offshell = (self._offshell_per_event and self._use_internal_mass_scalars
+                          and bool(self._internal_mass_pdgs))
+        _want_resarg = (self._resonance_per_event and self._use_internal_mass_scalars
+                        and bool(self._internal_mass_pdgs) and not _want_offshell)
+        offshell_masks = self._setup_offshell_masks(names) if _want_offshell else None
+        role_offshell = []   # per-event propagator off-shellness (s_prop − M²)
+        role_lrs = []        # per-event log10 sqrt(s_hat) (dimensionless_inputs)
+        role_factor = []     # per-event target factor (data.target_propagators; 1 when off)
+        role_sign = []       # per-event sign target (1 for x >= 0), used by training.sign_head
+        _near_w = float(self.cfg.training.get("sign_near_weight", 1.0) or 1.0) if getattr(self, "_sign_head", False) else 1.0
+        _near_f = float(self.cfg.training.get("sign_near_factor", 10.0))
+        _near_thr = np.full(len(names), -np.inf)      # per pool: near-zero threshold on the standardized target
+        _near_q = np.zeros(len(names))                # per pool: share of its training events below it
+        rng = np.random.default_rng(seed=42)
+        part_base = 0   # cumulative particle offset into the final flat array
+
+        for role in roles:
+            ds_parts, ds_toks = [], []
+            ev_starts, ev_pid, ev_order, amp_blocks = [], [], [], []
+            ev_resarg = []
+            ev_lrs = []          # dimensionless_inputs: log10 sqrt(s_hat) per event (GeV), for the mass feature
+            ev_offshell = []
+            ev_factor = []
+            ev_sign = []
+            P_of = []
+            for proc_idx, name in enumerate(names):
+                rec   = store[(role, name)]
+                parts = np.concatenate(list(self._model_momenta(rec, mom_div)), axis=0)   # (N, P, 4) float32
+                toks  = rec["tokens"]           # (N, P)
+                N, P  = parts.shape[0], parts.shape[1]
+                self._proc_npart[proc_idx] = int(P)
+                m = prepd_means[proc_idx] if per_dataset else prepd_means[0]
+                s = prepd_stds[proc_idx]  if per_dataset else prepd_stds[0]
+                tr = self._amp_trafos_pp[proc_idx] if self._amp_trafos_pp else amp_trafos
+                amp_prepd, _, _ = preprocess_amplitude(
+                    rec["raw_amp"], trafos=tr, mean=m, std=s,
+                )
+                ds_parts.append(parts.reshape(N * P, 4))
+                ds_toks.append(np.asarray(toks).reshape(N * P))
+                ev_starts.append(part_base + np.arange(N, dtype=np.int64) * P)
+                P_of.append(np.full(N, P, dtype=np.int64))
+                ev_pid.append(np.full(N, proc_idx, dtype=np.int32))
+                ev_order.append(np.tile(
+                    self._order_row(proc_idx, amp_orders), (N, 1)))
+                amp_blocks.append(amp_prepd)
+                ev_factor.append(np.asarray(rec.get("amp_factor", np.ones_like(rec["raw_amp"])),
+                                            dtype=np.float64).reshape(-1))
+                ev_sign.append((np.asarray(rec["raw_amp"]).reshape(-1) >= 0).astype(np.float32))
+                if role == "train" and _near_w > 1:
+                    # training.sign_near_weight: the events within a factor sign_near_factor of zero (|x| below the
+                    # pool's training median over that factor, prep_signed_pools.py's near-zero events), as a
+                    # threshold on this pool's standardized target, and their share
+                    ax = np.abs(np.asarray(rec["raw_amp"], dtype=np.float64).reshape(-1))
+                    thr = float(np.median(ax)) / _near_f
+                    ty, _, _ = preprocess_amplitude(np.array([max(thr, 1e-300)]), trafos=tr, mean=m, std=s)
+                    _near_thr[proc_idx] = float(np.asarray(ty).reshape(-1)[0])
+                    _near_q[proc_idx] = float((ax < thr).mean())
+                if _dimless:
+                    ev_lrs.append(np.log10(rec["rs"]).astype(np.float32))
+                if _want_resarg:
+                    # per-event √s (physical) from the initial pair (parts are /mom_div)
+                    pg = _phys(rec)
+                    q  = pg[:, 0, :] + pg[:, 1, :]                          # (N,4) GeV
+                    s2 = q[:, 0] ** 2 - (q[:, 1:] ** 2).sum(axis=1)
+                    roots = np.sqrt(np.clip(s2, 0.0, None))                 # (N,)
+                    mz = self._internal_mass_by_proc[proc_idx]              # [m_pdg...]
+                    ev_resarg.append(np.stack([roots - float(m) for m in mz], axis=1
+                                              ).astype(np.float32))          # (N, n_pdg)
+                if _want_offshell:
+                    # Per-event propagator off-shellness s_prop − M², one column per
+                    # internal_mass_pdgs entry. mask contracts the event momenta into
+                    # the propagator 4-momentum (physical = /mom_div × mom_div); the
+                    # nearest-pole propagator (min |s−M²|) dominates when a PDG appears
+                    # in several channels. Columns for PDGs absent from the process stay
+                    # 0 (the on-arm state), so mixed process sets share one width.
+                    n_pdg = len(self._internal_mass_pdgs)
+                    cols  = np.zeros((N, n_pdg), dtype=np.float64)
+                    sel   = offshell_masks[proc_idx] if offshell_masks is not None else None
+                    if sel is not None:
+                        pp = _phys(rec)                                      # (N,P,4) GeV
+                        # dimensionless_inputs: (s_prop - M^2) / s_hat, a pure number like every other input
+                        s_ev = rec["rs"] ** 2 if "rs" in rec else 1.0
+                        for c, pdg in enumerate(self._internal_mass_pdgs):
+                            props = sel.get(pdg, [])
+                            if not props:
+                                continue
+                            offs = []
+                            for mrow, mm in props:
+                                q = np.einsum("s,nsc->nc", mrow, pp)             # (N,4) physical
+                                s_prop = q[:, 0] ** 2 - (q[:, 1:] ** 2).sum(axis=1)
+                                offs.append((s_prop - mm) / s_ev)               # (N,)
+                            offs = np.stack(offs, axis=1)                       # (N, n_props)
+                            idx  = np.argmin(np.abs(offs), axis=1)
+                            cols[:, c] = offs[np.arange(N), idx]
+                    ev_offshell.append(cols.astype(np.float32))
+                rec.pop("com", None)            # its network momenta are in ds_parts; nothing reads it further
+                part_base += N * P
+
+            starts = np.concatenate(ev_starts)
+            ends   = starts + np.concatenate(P_of)
+            offs   = np.stack([starts, ends], axis=1)        # (N_role, 2)
+            amp    = np.concatenate(amp_blocks, axis=0)
+            pid    = np.concatenate(ev_pid)
+            order  = np.concatenate(ev_order, axis=0)
+
+            perm = rng.permutation(offs.shape[0])
+            role_particles.append(np.concatenate(ds_parts, axis=0))
+            role_tokens.append(np.concatenate(ds_toks, axis=0))
+            role_offsets.append(offs[perm])
+            role_amp.append(amp[perm])
+            role_pid.append(pid[perm])
+            role_order.append(order[perm])
+            role_factor.append(np.concatenate(ev_factor, axis=0)[perm])
+            role_sign.append(np.concatenate(ev_sign, axis=0)[perm])
+            if _want_resarg:
+                role_resarg.append(np.concatenate(ev_resarg, axis=0)[perm])
+            if _want_offshell:
+                role_offshell.append(np.concatenate(ev_offshell, axis=0)[perm])
+            if _dimless:
+                role_lrs.append(np.concatenate(ev_lrs, axis=0)[perm])
+            role_counts[role] = offs.shape[0]
+            self._role_perm[role] = perm
+
+        for k in store:
+            store[k].pop("com", None)
+        # dtypes chosen so AmplitudeDataset (torch.as_tensor) shares these buffers
+        # zero-copy across all loaders instead of copying per loader.
+        self.particles_flat   = np.concatenate(role_particles, axis=0).astype(self._mom_np_dtype(), copy=False)
+        self.tokens_flat      = np.concatenate(role_tokens, axis=0).astype(np.int64, copy=False)
+        self.offsets          = np.concatenate(role_offsets, axis=0)
+        self.all_amplitudes   = np.concatenate(role_amp, axis=0).astype(np.float32, copy=False)
+        self.all_process_ids  = np.concatenate(role_pid, axis=0).astype(np.int64, copy=False)
+        self.all_order_labels = np.concatenate(role_order, axis=0).astype(np.float32, copy=False)
+        self.all_amp_factor   = (np.concatenate(role_factor, axis=0)
+                                 if getattr(self, "_target_factor_on", False) else None)
+        if getattr(self, "_sign_head", False):
+            # second target column: the sign; the per-process flag says where the sign loss
+            # applies (the pools resolved to abslog, i.e. the sign-changing ones)
+            sign = np.concatenate(role_sign, axis=0).astype(np.float32)
+            self.all_amplitudes = np.concatenate([self.all_amplitudes.reshape(-1, 1), sign[:, None]], axis=1)
+            assert per_dataset and self._amp_trafos_pp, \
+                "sign_head needs data.preprocess_per_dataset (the sign-changing pools are resolved per pool)"
+            pp_tr = self._amp_trafos_pp
+            leftover = [self.cfg.data.dataset[i] for i, t in enumerate(pp_tr) if str(t[0]).startswith("signedlog")]
+            assert not leftover, (f"sign_head is on but {len(leftover)} pools carry a signedlog transform "
+                                  f"(frozen stats from a run without the sign head?), e.g. {leftover[:3]}")
+            self._proc_signed = np.array([bool(t and str(t[0]).startswith("abslog")) for t in pp_tr],
+                                         dtype=np.float32)
+            if _near_w > 1 and "train" in roles:
+                # per-event BCE weight (1 + (w - 1) near) / (1 + (w - 1) q_p): the near-zero events weigh w times the
+                # others and each pool's mean weight stays 1, so the sign loss is moved toward the crossing, not grown
+                self._sign_near_thr = _near_thr.astype(np.float32)
+                self._sign_near_norm = (1.0 / (1.0 + (_near_w - 1.0) * _near_q)).astype(np.float32)
+                sg = self._proc_signed > 0
+                LOGGER.info(f"sign_near_weight {_near_w}: events within a factor {_near_f} of zero weigh {_near_w}x in "
+                            f"the sign loss; their median share on the signed pools "
+                            f"{float(np.median(_near_q[sg])) if sg.any() else float('nan'):.4f}")
+            LOGGER.info(f"sign_head ON: {int(self._proc_signed.sum())}/{self.n_datasets} sign-changing pools "
+                        f"carry the sign loss (weight {float(self.cfg.training.get('sign_loss_weight', 1.0))}); "
+                        f"their target is log|x|")
+        if _want_resarg:
+            # Replace the internal-mass slot (last n_pdg cols) with the PER-EVENT
+            # resonance argument (√s − m), standardized to O(1). This hands the model
+            # the kinematic×mass interaction directly — a diagnostic for whether that
+            # interaction (not the info) is what the plain internal-mass scalar can't learn.
+            resarg = np.concatenate(role_resarg, axis=0).astype(np.float32)
+            mu, sd = resarg.mean(0), resarg.std(0)
+            sd[sd < 1e-8] = 1.0
+            resarg = (resarg - mu) / sd
+            n_pdg = len(self._internal_mass_pdgs)
+            self.all_order_labels[:, -n_pdg:] = resarg
+            LOGGER.info(f"resonance_per_event ON: internal-mass slot ({n_pdg} col) filled "
+                        f"per-event with standardized (√s − m) for pdgs {self._internal_mass_pdgs}")
+        if _want_offshell:
+            # Replace the internal-mass slot with the PER-EVENT propagator off-shellness
+            # s_prop − M², fed DIRECTLY here (not via the diagram encoder, which dilutes
+            # it). s−M² is wide/bimodal (±thousands of GeV²), so signed-log compress then
+            # unit-std per column — matching the diagram-virtuality treatment. This is the
+            # general form of the proven s-channel reson result.
+            osh = np.concatenate(role_offshell, axis=0).astype(np.float64)
+            # dimensionless_inputs: osh is (s - M^2) / s_hat; log1p's unit, 1 GeV^2 above, becomes
+            # data.dimless_offshell_eps x s_hat (default 1e-6: 1 GeV^2 at sqrt(s_hat) = 1 TeV), so the near-pole
+            # region keeps the resolution it had in GeV^2 instead of collapsing onto 0
+            if _dimless:
+                osh = osh / float(self.cfg.data.get("dimless_offshell_eps", 1e-6))
+            osh = np.sign(osh) * np.log1p(np.abs(osh))
+            # the column stats are fitted on every role together, so they move with the val/test pools;
+            # a run rebuilt on another pool (tools/rebuild_run.py) pins the run's own through
+            # data.offshell_stats, else the swapped split shifts the input of every event
+            mu, sd = self._resolve_offshell_stats(lambda: (osh.mean(0), osh.std(0)), osh.shape[1])
+            osh = ((osh - mu) / sd).astype(np.float32)
+            if bool(self.cfg.data.get("offshell_zero", False)):
+                # data.offshell_zero (kit_benchmark A_ft off arms): the off-shellness columns held at 0, so a parent
+                # trained with them loads unchanged and they carry nothing; they enter only through the first Linear
+                # of the input and frames nets (concatenated per-particle scalars), where a zero column is the same
+                # as the column removed (offshell_per_event=false and internal_mass_scalars=false)
+                osh[:] = 0.0
+                LOGGER.info("offshell_zero: off-shellness columns held at 0")
+            n_pdg = len(self._internal_mass_pdgs)
+            self.all_order_labels[:, -n_pdg:] = osh
+            self._offshell_cols = (self.all_order_labels.shape[1] - n_pdg, self.all_order_labels.shape[1])
+            LOGGER.info(f"offshell_per_event ON: internal-mass slot ({n_pdg} col) filled "
+                        f"per-event with signed-log-standardized (s−M²) for pdgs "
+                        f"{self._internal_mass_pdgs}")
+        if _dimless:
+            # one column past the model's order features: the wrapper takes it off and uses it only to put each
+            # massive particle's table mass in units of its event's sqrt(s_hat) (wrappers.setup_dimless_mass), so
+            # no absolute scale reaches the network. Appended after the off-shellness fill, which writes the last
+            # n_pdg columns of the order features.
+            lrs = np.concatenate(role_lrs, axis=0).astype(np.float32)
+            self.all_order_labels = np.concatenate([self.all_order_labels, lrs[:, None]], axis=1)
+            LOGGER.info(f"dimensionless_inputs ON: momenta per event / sqrt(s_hat), masses as log10(m / sqrt(s_hat)), "
+                        f"off-shellness / s_hat; sqrt(s_hat) {np.median(10 ** lrs):.4g} GeV median "
+                        f"({np.percentile(10 ** lrs, 5):.4g} to {np.percentile(10 ** lrs, 95):.4g})")
+        self.n_order_features = n_order_features
+        self.N_events         = self.offsets.shape[0]
+        self._role_counts     = (role_counts["train"], role_counts["val"],
+                                  role_counts["test"])
+
+        # --- freeze stats to this run's dir (skip if already present, i.e. a
+        #     warm-start resume; a fine-tune persists the inherited stats here so
+        #     the fine-tune run can itself be resumed reproducibly). ---
+        if self.cfg.save and not os.path.exists(stats_path):
+            self._save_data_stats(stats_path, mom_div, amp_trafos, per_dataset)
+
+        self._finalize_data_sizing()
+
+    def _resolve_amp_preprocessing(self, names, roles, get_amp, train_raw, npart_of, per_dataset,
+                                   amp_trafos, amp_trafos_pp, prepd_means, prepd_stds, global_min=None):
+        """The recipe path's amplitude transform and standardization (shared by the in-memory and the memmap paths).
+        get_amp(role, name): that pool's raw amplitudes (None if absent); train_raw: the train amplitudes concatenated
+        over `names`, or a callable returning them (read only when needed); npart_of(name): its particle count;
+        amp_trafos ... prepd_stds: the frozen statistics, None when fitted here; global_min: the minimum over every
+        role's amplitudes when the caller has it. Sets self._amp_trafos_pp, self._sign_head, cfg.data.amp_trafos,
+        self.prepd_mean / prepd_std (and self._affine_multiplicity); returns (amp_trafos, prepd_means, prepd_stds)."""
+        _train_raw = train_raw if callable(train_raw) else (lambda: train_raw)
+        # Resolve the amplitude transform. Per-dataset (preprocess_per_dataset) resolves
+        # it INDEPENDENTLY per process: a positive-definite |M|² dataset uses `log`
+        # (compresses its multiplicative range to ~unit std), a genuinely-signed one
+        # (e.g. an NLO virtual with negative events) uses `signedlog`. A GLOBAL
+        # resolution forces signedlog on EVERY process as soon as ONE dataset has a
+        # negative event — and signedlog leaves sub-1 amplitudes in linear scale
+        # (log1p(x)≈x for |x|≪1, and every |M|² is ≪1), so those targets never
+        # standardize to unit variance and the datasets don't train. self.cfg.data.
+        # amp_trafos keeps a representative resolution; per-process trafos in _amp_trafos_pp.
+        base_trafos = list(self.cfg.data.amp_trafos)
+        self._amp_trafos_pp = None
+        self._sign_head = bool(self.cfg.training.get("sign_head", False))
+        assert self._sign_head or not int(self.cfg.model.get("sign_pair_dim", 0) or 0), \
+            "model.sign_pair_dim needs training.sign_head (its channels feed the sign logit)"
+        if self._sign_head and self.cfg.training.loss == "HETEROSC":
+            # HETEROSC with the sign head (D287): the readout gets a sign row between mu and sigma (rows [mu, sign,
+            # sigma], models/lloca.py sign_channel); out_channels stays the target's dimension, so the sigma split
+            # (the last out_shape channels), the sign split (the last remaining one) and the sigma stage (the last
+            # out_shape rows) read the rows by role
+            assert self.modelname == "LLOCAMuPTransformer", "sign_head under HETEROSC is implemented on the μP LLoCa net"
+            assert not int(self.cfg.model.get("sign_pair_dim", 0) or 0), \
+                "model.sign_pair_dim is not combined with HETEROSC (the pair channels would sit where sigma does)"
+            assert self.cfg.model.net.get("sigma_after_pool", True), "sign_head under HETEROSC needs sigma_after_pool"
+            with open_dict(self.cfg):
+                self.cfg.model.net.sign_channel = True
+        elif self._sign_head:
+            assert self.modelname in ("LLOCATransformer", "LLOCAMuPTransformer", "MuPLGATr", "MuPLGATrSlim"), \
+                "sign_head is implemented on the LLoCa path"
+            # model.sign_pair_dim K > 0: K more per-particle channels feed the wrapper's pair sign head
+            # (wrappers.AmplitudeLLoCaWrapper._sign_pair_logit); the wrapper still returns [magnitude, sign logit]
+            k_pair = int(self.cfg.model.get("sign_pair_dim", 0) or 0)
+            with open_dict(self.cfg):
+                self.cfg.model.net.out_channels = int(self.cfg.model.net.get("out_channels", 1)) + 1 + k_pair
+        q = self._signedlog_quantile()
+        shift = self._signedlog_scale_shift()
+        # data.signed_magnitude_target (training): a signed pool trains on its magnitude, log max(|x|, s) ('abslog',
+        # the sign head's target), with no sign output and no sign loss: the het arms' one-loop control (plan
+        # catalog_coverage step 47), where HETEROSC rules out the sign head and the signed pools otherwise take signedlog
+        _abslog = (self._sign_head or bool(self.cfg.data.get("signed_abslog", False))
+                   or bool(self.cfg.data.get("signed_magnitude_target", False)))
+        # data.signed_abslog changes a signed pool's target to log max(|x|, s) with no sign output: a scoring-only read
+        # (tools/zero_shot_parent.py --signed-magnitude), never a training target
+        assert not (self.cfg.data.get("signed_abslog", False) and self.cfg.get("train", True)), \
+            "data.signed_abslog is for scoring only (train=false): a model trained on it never sees the sign"
+        if amp_trafos is None:                       # fresh run: resolve from raw amps
+            # the sign decision (positive -> log, signed -> signedlog) looks at every role
+            # of a process; the scale and the statistics stay train-only
+            all_roles = lambda n: np.concatenate(
+                [get_amp(r, n) for r in roles if get_amp(r, n) is not None], axis=0)
+            # global_min (the memmap path) stands in for every role's amplitudes in the sign test; the train
+            # amplitudes are then read only for a signed pool's scale
+            sign_data = (np.array([global_min]) if global_min is not None
+                         else np.concatenate([all_roles(n) for n in names], axis=0))
+            amp_trafos = resolve_amp_trafos(
+                base_trafos, sign_data if global_min is not None and global_min > 0 else _train_raw(),
+                scale_quantile=q, sign_data=sign_data, scale_shift=shift)
+            if per_dataset:
+                self._amp_trafos_pp = [
+                    resolve_amp_trafos(base_trafos, get_amp("train", n),
+                                       scale_quantile=q, sign_data=all_roles(n),
+                                       # data.signed_abslog (scoring only, tools/zero_shot_parent.py --signed-magnitude):
+                                       # a signed pool read as log|M| ('abslog'), as with the sign head, but no sign
+                                       # output is added, so a model without one can be scored on the magnitude
+                                       sign_head=_abslog,
+                                       # data.signedlog_scale_shift moves the signedlog scale only; abslog's floor
+                                       # stays at its quantile
+                                       scale_shift=0.0 if _abslog else shift)
+                    for n in names]
+        elif per_dataset and amp_trafos_pp:          # frozen stats: reload as stored
+            assert len(amp_trafos_pp) == len(names), (
+                f"frozen amp_trafos_pp has {len(amp_trafos_pp)} entries for {len(names)} datasets")
+            self._amp_trafos_pp = [list(t) for t in amp_trafos_pp]
+        elif per_dataset:
+            # Frozen stats that predate the stored per-process transforms: the parent
+            # resolved each pool in legacy mode (plain `log` for a positive pool, bare
+            # `signedlog` with s = 1 for a signed one) and fitted its mean/std on that,
+            # so reproduce exactly that; re-resolving with the scale would change the
+            # target under the parent's statistics.
+            self._amp_trafos_pp = [
+                resolve_amp_trafos(base_trafos, get_amp("train", n),
+                                   scale_quantile=None)
+                for n in names]      # legacy: train-only sign decision, as the parent did
+            LOGGER.warning(
+                "Frozen data stats carry no per-process amplitude transforms (written before "
+                "the signed-log scale); re-resolved per pool in legacy mode (unscaled signedlog).")
+        self.cfg.data.amp_trafos = amp_trafos
+        assert not self.cfg.data.get("affine_multiplicity_std", False) or (
+            per_dataset and self.cfg.data.get("shared_standardization", False)), \
+            "data.affine_multiplicity_std refines data.shared_standardization (per-dataset transforms, one sigma)"
+        assert not self.cfg.data.get("level_file") or (
+            per_dataset and self.cfg.data.get("shared_standardization", False)), \
+            "data.level_file sets the means of data.shared_standardization (per-dataset transforms, one sigma)"
+        self._amp_npart = {nm: int(npart_of(nm)) for nm in names}   # the head map of a fine-tune reads it
+        _pts = getattr(self, "_ft_parent_target_stats", None)
+        if prepd_means is None and _pts is not None:
+            prepd_means, prepd_stds, _kind = parent_target_standardization(_pts, [npart_of(nm) for nm in names],
+                                                                            names=list(names))
+            if _kind == "affine_multiplicity":
+                self._affine_multiplicity = dict(_pts["affine_multiplicity"])
+            if _kind == "level_file":
+                self._level_file = dict(_pts["level_file"])
+            LOGGER.info(f"parent_shared: the parent's {_kind} standardization, means "
+                        f"{[f'{m:.3f}' for m in prepd_means]}, sigma {prepd_stds[0]:.3f}")
+        elif prepd_means is None:
+            if per_dataset:
+                prepd_means, prepd_stds = [], []
+                for i, name in enumerate(names):
+                    tr = self._amp_trafos_pp[i] if self._amp_trafos_pp else amp_trafos
+                    _, m, s = preprocess_amplitude(
+                        get_amp("train", name), trafos=tr)
+                    prepd_means.append(float(m)); prepd_stds.append(float(s))
+                if bool(self.cfg.data.get("shared_standardization", False)):
+                    # one (mu, sigma) pooled over every process's transformed train targets, each process
+                    # keeping its own transform (log, or signedlog for a signed pool): the network then
+                    # predicts each process's normalization, so a process without data can be scored
+                    # zero-shot. A single global transform is not an option: one signed pool forces
+                    # signedlog on every process and leaves |M|^2 << 1 in linear scale.
+                    n = np.array([len(get_amp("train", nm)) for nm in names], dtype=np.float64)
+                    mu_p, sd_p = np.array(prepd_means), np.array(prepd_stds)
+                    mu = float((n * mu_p).sum() / n.sum())
+                    sd = float(np.sqrt((n * (sd_p ** 2 + (mu_p - mu) ** 2)).sum() / n.sum()))
+                    prepd_means, prepd_stds = [mu] * len(names), [sd] * len(names)
+                    LOGGER.info(f"shared_standardization: one (mu, sigma) = ({mu:.3f}, {sd:.3f}) pooled over "
+                                f"{len(names)} processes, per-process transforms kept")
+                    if self.cfg.data.get("level_file"):
+                        # llm_compare step 16 (D564): each process's mean from a frozen level predicted from the
+                        # process alone (analysis/catalog_pp/norm_explore3.py, level_file_B_diag.json), one sigma
+                        assert not bool(self.cfg.data.get("affine_multiplicity_std", False)), \
+                            "data.level_file replaces data.affine_multiplicity_std's mu_N: set one of them"
+                        lp = str(self.cfg.data.level_file)
+                        lp = lp if os.path.isabs(lp) else os.path.join(os.path.dirname(os.path.abspath(__file__)), lp)
+                        lv = json.load(open(lp))["levels"]
+                        missing = [nm for nm in names if nm not in lv]
+                        assert not missing, f"data.level_file {lp}: no level for {missing}"
+                        lev = np.array([float(lv[nm]) for nm in names])
+                        # sigma is affine_multiplicity_std's own (the run it replaces): only the means change
+                        sd = fit_affine_multiplicity(n, [int(npart_of(nm)) for nm in names], mu_p, sd_p)[2]
+                        prepd_means, prepd_stds = lev.tolist(), [sd] * len(names)
+                        self._level_file = {"path": str(self.cfg.data.level_file), "sigma": sd,
+                                            "levels": {k: float(v) for k, v in lv.items()}}
+                        LOGGER.info(f"level_file: per-process means from {lp}, sigma = {sd:.4f}; median |own mean - "
+                                    f"level| over the train processes {float(np.median(np.abs(mu_p - lev))):.3f}")
+                    N_p = [int(npart_of(nm)) for nm in names]
+                    if bool(self.cfg.data.get("affine_multiplicity_std", False)) and len(set(N_p)) < 2:
+                        # one multiplicity (a single-process run of an A2 config, e.g. a fine-tune with its own
+                        # target stats): mu_N at the only N is the pooled mean, so the shared standardization above is it
+                        LOGGER.info(f"affine_multiplicity_std: one multiplicity N = {N_p[0]}, the shared "
+                                    f"standardization is the fit (no slope to record)")
+                    elif bool(self.cfg.data.get("affine_multiplicity_std", False)):
+                        # the draft's multiplicity preprocessing (Sec. "Extrapolating to more legs"):
+                        # mu_N = a + b N over the particle count N, one shared sigma (multiplicity_extrap)
+                        a, b, sd = fit_affine_multiplicity(n, N_p, mu_p, sd_p)
+                        prepd_means = [a + b * k for k in N_p]
+                        prepd_stds = [sd] * len(names)
+                        self._affine_multiplicity = {"a": a, "b": b, "sigma": sd}
+                        LOGGER.info(f"affine_multiplicity_std: mu_N = {a:.4f} + {b:.4f} N, sigma = {sd:.4f}; per "
+                                    f"process (N, own mean, mu_N): "
+                                    + ", ".join(f"{nm} ({k}, {m:.2f}, {a + b * k:.2f})"
+                                                for nm, k, m in zip(names, N_p, mu_p)))
+            else:
+                _, m, s = preprocess_amplitude(_train_raw(), trafos=amp_trafos)
+                prepd_means, prepd_stds = [float(m)], [float(s)]
+        self.prepd_mean = prepd_means
+        self.prepd_std  = prepd_stds
+        LOGGER.info(
+            f"Preprocessing amplitudes "
+            f"{'per-dataset (independent unit scale)' if per_dataset else 'globally (shared scale)'} "
+            f"using trafos={amp_trafos} (train-only stats); "
+            f"means={[f'{m:.3f}' for m in prepd_means]}"
+        )
+        return amp_trafos, prepd_means, prepd_stds
+
+    def _resolve_offshell_stats(self, stats_fn, n_cols):
+        """(mu, sd) of the off-shellness columns (data.offshell_per_event): pinned (data.offshell_stats), else
+        stats_fn() = (mean(0), std(0)) of the signed-log columns over every role, with a fine-tune's parent scale on
+        the columns that vary in both. Sets self._offshell_stats."""
+        pinned = self.cfg.data.get("offshell_stats", None)
+        if pinned is not None:
+            mu, sd = np.asarray(pinned[0], np.float64), np.asarray(pinned[1], np.float64)
+            assert mu.shape == (n_cols,) == sd.shape, f"data.offshell_stats {pinned} for {n_cols} columns"
+        else:
+            mu, s0 = stats_fn()
+            sd = s0.copy()
+            sd[sd < 1e-8] = 1.0
+            ft = self.cfg.get("fine_tune", None)
+            if ft is not None and ft.get("pretrained_path", None) is not None and not self.warm_start \
+                    and str(ft.get("offshell_stats", "parent")) == "parent":
+                # a fine-tune keeps the parent's scale on every column that varies in both, so the same
+                # off-shellness reaches the backbone as the same input. A column the parent saw constant
+                # (sd set to 1 above, standardized to 0) carries no learned scale, and a column the probe
+                # never fills (no propagator of that pdg) would land on the parent's on-shell value under
+                # the parent's scale: both are fitted here, centred on 0. Refitting every column shifted
+                # the input under the pretrained weights (docs/results.tex sec:ladder, the steering offset)
+                parent = getattr(self, "_parent_offshell", None)
+                if parent is None and ft.get("parent_offshell_stats", None) is not None:
+                    parent = OmegaConf.to_container(ft.parent_offshell_stats)   # parent without data_stats.json
+                assert parent is not None, (
+                    "fine_tune.offshell_stats=parent but the parent's data_stats.json has no offshell_stats "
+                    "(a run older than the record): pass fine_tune.parent_offshell_stats "
+                    "(tools/offshell_stats.py <parent run>) or set fine_tune.offshell_stats=own")
+                pm, ps = np.asarray(parent[0], np.float64), np.asarray(parent[1], np.float64)
+                assert pm.shape == mu.shape, f"parent offshell_stats {parent} for {mu.shape[0]} columns"
+                varied = (ps != 1.0) & (s0 >= 1e-8)
+                mu, sd = np.where(varied, pm, mu), np.where(varied, ps, sd)
+                LOGGER.info(f"Fine-tuning: off-shellness columns {np.flatnonzero(varied).tolist()} on the "
+                            f"parent's scale, the rest fitted here")
+        self._offshell_stats = [mu.tolist(), sd.tolist()]
+        return mu, sd
+
+    def _physics_logF(self, name, mom_phys, alphas=None):
+        """log of the factor data.target_physics_factor multiplies |M|^2 by, per event: (s0 / s_hat)^(4-N) / C_p (s_hat, a
+        fixed reference, or with target_physics_dim_ref=pairs the geometric mean of the 2 p_i.p_j), s_hat
+        = (p1 + p2)^2 of the two incoming momenta (mom_phys: (N, P, 4) in GeV, any frame), N the particle count, C_p
+        the leading tree diagram's coupling product (data.target_physics_couplings). One definition for the in-memory
+        and the memory-mapped path."""
+        if not hasattr(self, "_phys_logc"):
+            cp = os.path.expandvars(str(self.cfg.data.get(
+                "target_physics_couplings", "analysis/catalog_pp/data/diagram_couplings.json")))
+            cp = cp if os.path.isabs(cp) else os.path.join(os.path.dirname(os.path.abspath(__file__)), cp)
+            self._phys_logc = {k: max(v["logc2"]) for k, v in json.load(open(cp)).items()}
+            if bool(self.cfg.data.get("target_physics_dim_only", False)):
+                # the mass-dimension part alone, (s0 / s_hat)^(4-N), no coupling product (2026-10-22: the coupling
+                # product is what misplaced the held-out levels, e.g. ZHH carries ZH's)
+                self._phys_logc = {k: 0.0 for k in self._phys_logc}
+            self._phys_ls0 = float(np.log(float(self.cfg.data.get("target_physics_s0", 289.0))))
+        if bool(self.cfg.data.get("target_physics_dim_only", False)):
+            self._phys_logc.setdefault(name, 0.0)     # no coupling product enters: a process beyond the table is fine
+        assert name in self._phys_logc, f"target_physics_factor: no coupling product for {name}"
+        ref = self.cfg.data.get("target_physics_dim_ref", "shat")
+        if str(ref) == "shat":
+            q = mom_phys[:, 0].astype(np.float64) + mom_phys[:, 1].astype(np.float64)
+            lref = np.log(q[:, 0] ** 2 - (q[:, 1:] ** 2).sum(axis=1))
+        elif str(ref) == "pairs":
+            # the event's own scale (2026-10-22, the dimensionless path): log Lambda^2 = the mean over all pairs of
+            # external particles of log(2 p_i.p_j), so a soft or collinear particle lowers it; unit-free like s_hat,
+            # needs no fit and no knowledge of the cuts (a fixed s0 absorbs the typical emission scale only while
+            # every process shares one set of cuts)
+            pp = mom_phys.astype(np.float64)
+            g = np.einsum("npc,nqc->npq", pp * np.array([1.0, -1.0, -1.0, -1.0]), pp)        # Minkowski p_i.p_j
+            iu = np.triu_indices(pp.shape[1], 1)
+            lref = np.log(np.clip(2.0 * np.abs(g[:, iu[0], iu[1]]), 1e-12, None)).mean(axis=1)
+        elif str(ref) in ("qperp", "qperp_soft"):
+            # the event's emission history (2026-10-23, D99; physics_scales.qperp_logs): each particle beyond a 2->2
+            # core carries its own Lorentz-invariant emission scale q^2 instead of s_hat, so the ~s_hat/q^2 an extra
+            # soft or collinear particle adds is divided out and a 2->4 level stays inside the range the 2->3 trained
+            # on; every particle type alike. Handled apart below: it is a sum over steps, not N - 4 times one scale
+            lref = None
+        else:
+            # a fixed reference scale (GeV^2) instead of the event's s_hat: a change of units, e.g. 1e6 = |M|^2 in TeV
+            # (2026-10-22, the extrapolation round: B in TeV against B in GeV)
+            lref = np.full(mom_phys.shape[0], np.log(float(ref)))
+        # data.target_physics_orders (D93, the user 2026-10-22): the coupling homogeneity of a fixed-order amplitude,
+        # |M|^2 proportional to (4 pi alpha_s)^q (4 pi alpha)^e with q, e the process's orders (amp_orders: the coupling
+        # powers plus the loop counts), alpha_s each event's own (it was labelled at it), alpha the model's fixed value;
+        # like the mass dimension, exact for every process and known from its definition alone
+        lord = 0.0
+        if bool(self.cfg.data.get("target_physics_orders", False)):
+            assert alphas is not None, f"target_physics_orders: no per-event alpha_s for {name}"
+            o = self._orders_of(name)
+            # the order vector's powers are the stored target's (a stripped virtual's alpha_s is the Born's, the loop
+            # is counted apart, mg5_pipeline_final.order_vector)
+            q, e = int(o[2]), int(o[3])
+            # a mixed tree entry (four-quark, heavy-quark pair: the order vector records the two maxima, q + e above the
+            # tree's total degree nfinal) has several coupling monomials, so no single power is exact: refused
+            # a stripped one-loop QCD virtual (L_QCD = 1, its powers the Born's, order_vector) is mixed when its Born is:
+            # its powers then exceed nfinal the same way (by one more with alphas_prefactor, whose alpha_s power is k);
+            # loop-induced and electroweak one-loop entries carry an explicit order and are not judged here
+            import mg5_pipeline_final as mg
+            nfin = mom_phys.shape[1] - 2
+            pc = mg.PROCESSES.get(name, {})
+            virt = pc.get("kind") == "virt" and pc.get("order") is None
+            deg = nfin + (1 if (virt and pc.get("alphas_prefactor")) else 0)
+            # the alpha_s power is read from the generated diagrams where the entry has a sidecar (plan catalog_coverage,
+            # tools/mixed_order_audit.py): a mixed entry (catalog_4's full coupling orders: QCD-EW interference, 35%
+            # of its training pools) is a polynomial of total degree deg in (alpha_s, alpha), so no single monomial is
+            # exact; it is divided by its highest alpha_s power, the term catalog_3's minimal-QED pool of the same
+            # process stored alone, with that term's alpha power (its diagrams' QED order: a BSM coupling such as the
+            # Z' model's enters neither power), and the rest (a function of alpha / alpha_s) is left in the target. At the nominal
+            # alpha_s(M_Z) each event's alpha_s is fixed by its s_hat, so that rest is a function of the momenta. The
+            # sidecar also corrects the order vector's alpha_s power where it is wrong: v4's b-quark Higgs entries
+            # (massless b, no Yukawa: purely electroweak) and the gluon of zp_uux_Y1g and thdm_uux_h2h3g; the order
+            # features read the same sidecar (_orders_from_diagrams), so input and target agree
+            # data.orders_from_diagrams=false: the catalog table's powers (o) for the target too, the target as it was
+            # before the diagrams were read (a mixed entry refused); recorded in the frozen stats
+            # (_target_orders_source), so a run reusing a parent's statistics cannot switch it silently
+            _from_diag = self._target_orders_source() != "table"
+            # an lhe_pp pool (pp13_, pp13v4_, ee4_, dc_, dsh_, dE100_: MadEvent events of a catalog tree) carries its tree's table order
+            # explicitly, but is that tree: its powers come from its sidecar like the tree's (catalog_coverage, E3058:
+            # the smoke refused pp13v4_udx_adxgu, mixed [0,0,3,3], whose sidecar was there but never read)
+            if _from_diag and (pc.get("order") is None or pc.get("kind") == "lhe_pp"):
+                bo = self._diagram_born_orders(name)
+                if bo is not None:
+                    q, e = mg.target_monomial_from_diagrams(pc, bo)
+            assert not (int(o[1]) == 0 and (int(o[0]) == 0 or virt) and q + e > deg), (
+                f"target_physics_orders: {name} is a mixed-order entry {o} with no diagram sidecar to read its powers"
+                if _from_diag else
+                f"target_physics_orders: {name} is a mixed-order entry {o}, its coupling homogeneity is not exact")
+            a_em = 1.0 / float(self.cfg.data.get("target_physics_alpha_inv", 132.507))
+            lord = q * np.log(4 * np.pi * np.asarray(alphas, dtype=np.float64)) + e * np.log(4 * np.pi * a_em)
+        n_eik, leik = 0, 0.0
+        if bool(self.cfg.data.get("target_physics_eikonal", False)):
+            n_eik, leik = self._eikonal_logS(name, mom_phys)
+        if lref is None:
+            from physics_scales import qperp_logs
+            assert n_eik == 0, "target_physics_dim_ref=qperp: the eikonal factor would count the emissions twice"
+            # qperp_soft: the soft minimum over candidates (tau = data.target_physics_qperp_tau, default 0.3), no kink
+            # where the minimising pair changes (2026-10-24, analysis/catalog_pp/shape_learn.py)
+            soft = float(self.cfg.data.get("target_physics_qperp_tau", 0.3)) if str(ref) == "qperp_soft" else None
+            ldim = qperp_logs(mom_phys, soft=soft) - (mom_phys.shape[1] - 4) * self._phys_ls0
+            return ldim - (lord + self._phys_logc[name])
+        # data.target_physics_hybrid (D129, the user 2026-10-25): the s_hat target plus the process's constant c_p
+        # (_physics_hybrid_cp, fitted on its own momenta in init_data before any factor is applied)
+        lcp = 0.0
+        assert float(self.cfg.data.get("target_physics_hybrid_blend", 0.0)) == 0.0 or \
+            bool(self.cfg.data.get("target_physics_hybrid", False)), \
+            "target_physics_hybrid_blend: a blend of the hybrid target, needs data.target_physics_hybrid=true"
+        if bool(self.cfg.data.get("target_physics_hybrid", False)):
+            assert str(ref) == "shat" and n_eik == 0, "target_physics_hybrid: the s_hat reference, no eikonal factor"
+            assert name in getattr(self, "_phys_cp", {}), f"target_physics_hybrid: no constant for {name}"
+            lcp = self._phys_cp[name]
+            # data.target_physics_hybrid_blend (the user 2026-10-25, "run those two pretrainings blending emission
+            # scales"): lambda times the per-event emission-scale term minus its process mean c_p; 0 (default) is the
+            # hybrid, 1 the emission-scale target (physics_scales.hybrid_blend)
+            _lam = float(self.cfg.data.get("target_physics_hybrid_blend", 0.0))
+            if _lam != 0.0:
+                from physics_scales import hybrid_blend
+                lcp = lcp + hybrid_blend(mom_phys, self._phys_cp[name], _lam)
+        # the eikonal factors carry mass dimension -2 each, so the dimension factor's power grows by one per factor
+        return -((4 - mom_phys.shape[1] + n_eik) * (lref - self._phys_ls0) + leik + lord + self._phys_logc[name]) + lcp
+
+    @staticmethod
+    def _physics_hybrid_cp(mom_phys):
+        """data.target_physics_hybrid's constant of one process: physics_scales.hybrid_cp (kept for
+        analysis/catalog_3/hybrid_check.py)."""
+        from physics_scales import hybrid_cp
+        return hybrid_cp(mom_phys)
+
+    def _target_orders_source(self):
+        """Where the dimensionless target's coupling monomial comes from (data.target_physics_orders), recorded in the
+        frozen data stats: "diagrams_highest_alphas" (data.orders_from_diagrams, default: the generated diagrams'
+        powers where the entry has a sidecar, a mixed entry divided by its highest alpha_s power with that term's
+        alpha power, mg5_pipeline_final.target_monomial_from_diagrams) or "table" (the catalog's order vector, a mixed
+        entry refused). Stats written before the record were fitted with the table."""
+        return "diagrams_highest_alphas" if bool(self.cfg.data.get("orders_from_diagrams", True)) else "table"
+
+    # the commits that changed where the dimensionless target's coupling monomial comes from, oldest first, each with
+    # the source its code wrote: before the first, the catalog table's order vector; 6dee967a the alpha_s power from
+    # the diagrams with alpha = degree - alpha_s; 1d9d6a29 the alpha power from the diagrams' QED orders too (the
+    # current "diagrams_highest_alphas"). Commits from 77b43ae3 on record the source in data_stats.json.
+    _ORDERS_SOURCE_COMMITS = (("6dee967a49596d36a16055653cdf5a7df05f520b", "diagrams_alphas_only"),
+                              ("1d9d6a29464211df804574c3aeafea1cbbde11f8", "diagrams_highest_alphas"))
+
+    @classmethod
+    def _infer_orders_source(cls, run_dir):
+        """The coupling-monomial source of frozen data stats written before target_physics_orders_source was recorded,
+        inferred from the run that wrote them (run_dir, the folder of its data_stats.json), never from this run's
+        config: 1. the commit in its first log (out_0.log, "git_hash=..."), placed against _ORDERS_SOURCE_COMMITS with
+        git; 2. where no log or git answers, its dumped config.yaml: data.orders_from_diagrams present means the code
+        had the switch (its value), absent means "table" (the key is dumped only when a run sets it, so this fallback
+        reads a diagrams run of 6dee967a..77b43ae3 as the table; the log decides those). Returns (source, how)."""
+        import glob
+        import re
+        import subprocess
+        logs = sorted(glob.glob(os.path.join(run_dir, "out_*.log")),
+                      key=lambda p: (os.path.basename(p) != "out_0.log", p))
+        for log in logs:
+            try:
+                with open(log, errors="replace") as f:
+                    m = next((re.search(r"git_hash=([0-9a-f]{7,40})", ln) for ln in f if "git_hash=" in ln), None)
+            except OSError:
+                m = None
+            if not m:
+                continue
+            repo = os.path.dirname(os.path.abspath(__file__))
+            src = "table"
+            for commit, label in cls._ORDERS_SOURCE_COMMITS:
+                rc = subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor", commit, m.group(1)],
+                                    capture_output=True).returncode
+                if rc not in (0, 1):      # the commit is not in this checkout's history: ask the config instead
+                    src = None
+                    break
+                if rc == 0:
+                    src = label
+            if src is not None:
+                return src, f"{os.path.basename(log)} git_hash={m.group(1)[:8]}"
+            break
+        cfg_path = os.path.join(run_dir, "config.yaml")
+        if os.path.exists(cfg_path):
+            data = OmegaConf.load(cfg_path).get("data", {}) or {}
+            if "orders_from_diagrams" in data:
+                return ("diagrams_highest_alphas" if bool(data["orders_from_diagrams"]) else "table",
+                        "config.yaml data.orders_from_diagrams")
+            return "table", "config.yaml without data.orders_from_diagrams"
+        return "table", "no log commit, no config.yaml"
+
+    def _check_frozen_orders_source(self, stats, stats_dir=None):
+        """Refuse frozen data stats (a warm start's, a fine-tune parent's) fitted with another coupling-monomial source
+        than this run's (_target_orders_source) while the target divides by the monomial (data.target_physics_orders):
+        the diagrams' powers and the table's differ on the mixed and the mislabelled entries, a per-process shift of
+        the target the parent's standardization would hide (like target_propagators). Stats without the record are
+        placed by the run that wrote them (_infer_orders_source on stats_dir), else read as the table."""
+        if not bool(self.cfg.data.get("target_physics_orders", False)):
+            return
+        _a = stats.get("target_physics_orders_source")
+        if _a is None:
+            _a, how = self._infer_orders_source(stats_dir) if stats_dir else ("table", "no run directory")
+            LOGGER.info(f"frozen data stats without target_physics_orders_source: {_a} ({how})")
+        _a, _b = str(_a), self._target_orders_source()
+        assert _a == _b, (f"frozen data stats were fitted with target_physics_orders_source={_a}, this run sets {_b} "
+                          f"(data.orders_from_diagrams)")
+
+    def _diagram_born_orders(self, name):
+        """The (QCD, QED) orders of a process's Born amplitudes from its diagram sidecar
+        (mg5_pipeline_final.sidecar_born_orders); None without a sidecar."""
+        cache = self.__dict__.setdefault("_diag_born_orders", {})
+        if name not in cache:
+            ddir = self.cfg.model.get("diagrams_dir", "data/diagrams")
+            ddir = ddir if os.path.isabs(ddir) else os.path.join(os.path.dirname(os.path.abspath(__file__)), ddir)
+            path = self._resolve_diagram_path(ddir, name)
+            if path is None:
+                cache[name] = None
+            else:
+                import mg5_pipeline_final as mg
+                cache[name] = mg.sidecar_born_orders(path)
+        return cache[name]
+
+    def _orders_from_diagrams(self, names, orders):
+        """The order features' coupling powers from the generated diagrams (mg5_pipeline_final.order_vector_from_diagrams),
+        the same source the dimensionless target's coupling monomial reads (_diagram_born_orders), so input and target
+        cannot disagree: the hand-set table claims an alpha_s^2 term for catalog_4's b-quark Higgs entries (massless b,
+        purely electroweak) and misses the gluon of zp_uux_Y1g and thdm_uux_h2h3g, and counts the Z' coupling of
+        zp_uux_Y1g as alpha^2 (plan catalog_coverage). A mixed entry
+        keeps the convention of the four-quark entries, both maxima (the largest alpha_s power and the largest alpha
+        power), so the feature says which monomials the stored target holds; the target divides by the first.
+        Idempotent; entries with an explicit order (loop-induced) or without a sidecar keep theirs (the latter listed).
+        Off with data.orders_from_diagrams=false. Pool names and recipe ids do not depend on it (recipe_id drops
+        amp_orders)."""
+        import mg5_pipeline_final as mg
+        if not bool(self.cfg.data.get("orders_from_diagrams", True)):
+            return [list(o) for o in orders]
+        base = getattr(self, "_recipe_base_by_name", {}) or {}
+        out, changed, missing, n_read = [], [], [], 0
+        for name, o in zip(names, orders):
+            o = [int(x) for x in o]
+            pc = mg.PROCESSES.get(name) or mg.PROCESSES.get(base.get(name, "")) or catalog_cfg_for_dataset(name)
+            if pc is None or (pc.get("order") is not None and pc.get("kind") != "lhe_pp") or "nfinal" not in pc \
+                    or len(o) != 4:
+                out.append(o)
+                continue
+            qd = self._diagram_born_orders(name)
+            if qd is None:
+                missing.append(name)
+                out.append(o)
+                continue
+            n_read += 1
+            new = mg.order_vector_from_diagrams(pc, qd, o)
+            if new != o:
+                changed.append((name, o, new))
+            out.append(new)
+        LOGGER.info(f"orders_from_diagrams: coupling powers read from the diagrams for {n_read}/{len(names)} "
+                    f"processes, {len(changed)} differ from the catalog table: {changed}")
+        if missing:
+            LOGGER.warning(f"orders_from_diagrams: no diagram sidecar for {len(missing)} processes, their order "
+                           f"features stay the catalog table's: {missing}")
+        return out
+
+    def _orders_of(self, name):
+        """[L_QCD, L_EW, alpha_s power, alpha power] of a process: the resolved data.amp_orders entry, the same vector
+        the order features carry (a recipe entry's explicit amp_orders wins over mg5_pipeline_final.order_vector)"""
+        names = list(self.cfg.data.dataset)
+        return [int(x) for x in self.cfg.data.amp_orders[names.index(name)]]
+
+    def _eikonal_logS(self, name, mom_phys):
+        """data.target_physics_eikonal (2026-10-22; not used: the user, the same day, "these kinds of priors shouldn't go
+        in the target, since this is very laser focused on photons and gluons" -- the eikonal is to enter as an input,
+        kept here for that and for comparison): per event,
+        the sum over final gluons and photons k of log(w_k sum_{a<b} s_ab / (s_ak s_bk)), the pairs over the other
+        coloured legs (gluon, w = C_A = 3) or the other charged legs (photon, w = 1), every external leg counted
+        (incoming ones too), s_xy = 2 |p_x.p_y| (norm_surrogate.py's eik term). It is the cost of one more soft or
+        collinear particle, computed from the momenta and the particle table's charge and colour only, so it needs
+        no data of the process and no knowledge of its cuts. Returns (number of factors, (N,) log of their product)."""
+        from particle_ids import PARTICLE_PROPERTIES
+        pdgs = getattr(self, "_slot_pdgs_by_name", {}).get(name)
+        if pdgs is None:                 # the memory-mapped path computes the target before it records the slot order
+            import mg5_pipeline_final as mg
+            pdgs = [int(x) for x in mg.PROCESSES[name]["pdg_ids"]]
+        assert len(pdgs) == mom_phys.shape[1], (name, pdgs, mom_phys.shape)
+        pp = mom_phys.astype(np.float64)
+        g = 2.0 * np.abs(np.einsum("npc,nqc->npq", pp * np.array([1.0, -1.0, -1.0, -1.0]), pp))
+        g = np.clip(g, 1e-12, None)
+        out, n = np.zeros(pp.shape[0]), 0
+        for k in range(2, len(pdgs)):
+            if pdgs[k] not in (21, 22):
+                continue
+            col = pdgs[k] == 21
+            em = [a for a in range(len(pdgs)) if a != k and
+                  (PARTICLE_PROPERTIES[pdgs[a]][7] > 0 if col else PARTICLE_PROPERTIES[pdgs[a]][0] != 0)]
+            if len(em) < 2:
+                continue
+            S = sum(g[:, a, b] / (g[:, a, k] * g[:, b, k]) for i, a in enumerate(em) for b in em[i + 1:])
+            out += np.log((3.0 if col else 1.0) * S)
+            n += 1
+        return n, out
+
+    @staticmethod
+    def _born_of_pool(pool, n):
+        """The first n rows of a one-loop pool's Born sidecar, (n, 1), checked positive and computed on this pool
+        (data.target_over_born). The sidecar's name is tools/nlo_virtual_pipeline.born_path's, not imported: that module
+        loads the MadGraph pipeline."""
+        bp = pool[:-len(".npy")] + ".born.npy" if pool.endswith(".npy") else pool + ".born.npy"
+        assert os.path.exists(bp), (f"data.target_over_born: no Born sidecar {bp} "
+                                    f"(tools/nlo_virtual_pipeline.py <process> --born-of <pool> writes it)")
+        # the sidecar's record of the pool it was computed on (tools/nlo_virtual_pipeline.born_of_pool), so a pool
+        # regenerated under a surviving sidecar is refused instead of pairing one event's V with another's Born
+        assert os.path.exists(bp + ".json"), f"data.target_over_born: {bp} has no identity record {bp}.json"
+        rec = json.load(open(bp + ".json"))
+        assert list(rec["pool_identity"]) == list(pool_identity(pool)), \
+            f"data.target_over_born: {bp} was computed on another pool than {pool}"
+        b = np.asarray(np.load(bp, mmap_mode="r")[:n], dtype=np.float64).reshape(-1, 1)
+        assert b.shape[0] == n, f"data.target_over_born: {bp} has {b.shape[0]} rows, the pool {n}"
+        assert np.all(np.isfinite(b)) and np.all(b > 0), f"data.target_over_born: non-positive Born in {bp}"
+        return b
+
+    def _save_data_stats(self, stats_path, mom_div, amp_trafos, per_dataset):
+        """Write the frozen data statistics (data_stats.json) a resume / fine-tune / rebuild reloads."""
+        with open(stats_path, "w") as f:
+            json.dump({
+                "mom_div":    float(mom_div),
+                "mom_mean":   float(self.mom_mean[0]),
+                "mom_std":    float(self.mom_std[0]),
+                "amp_trafos": list(amp_trafos) if amp_trafos else amp_trafos,
+                "amp_trafos_pp": ([list(t) for t in self._amp_trafos_pp]
+                                  if self._amp_trafos_pp else None),
+                "preprocess_per_dataset": per_dataset,
+                "shared_standardization": bool(self.cfg.data.get("shared_standardization", False)),
+                **({"affine_multiplicity": self._affine_multiplicity}
+                   if getattr(self, "_affine_multiplicity", None) else {}),
+                **({"level_file": self._level_file} if getattr(self, "_level_file", None) else {}),
+                "target_propagators": bool(self.cfg.data.get("target_propagators", False)),
+                "target_over_born": bool(self.cfg.data.get("target_over_born", False)),
+                "signedlog_scale_shift": self._signedlog_scale_shift(),
+                "target_physics_factor": bool(self.cfg.data.get("target_physics_factor", False)),
+                "target_physics_dim_only": bool(self.cfg.data.get("target_physics_dim_only", False)),
+                "target_physics_eikonal": bool(self.cfg.data.get("target_physics_eikonal", False)),
+                "target_physics_orders": bool(self.cfg.data.get("target_physics_orders", False)),
+                "target_physics_orders_source": self._target_orders_source(),
+                "target_physics_hybrid": bool(self.cfg.data.get("target_physics_hybrid", False)),
+                "target_physics_hybrid_cp": getattr(self, "_phys_cp", None) or None,
+                "target_physics_hybrid_blend": float(self.cfg.data.get("target_physics_hybrid_blend", 0.0)),
+                "target_physics_alpha_inv": float(self.cfg.data.get("target_physics_alpha_inv", 132.507)),
+                "dimensionless_inputs": bool(self.cfg.data.get("dimensionless_inputs", False)),
+                "dimless_mass_stats": getattr(self, "_dimless_mass_stats", None),
+                "target_physics_dim_ref": str(self.cfg.data.get("target_physics_dim_ref", "shat")),
+                "target_physics_s0": float(self.cfg.data.get("target_physics_s0", 289.0)),
+                "target_physics_couplings": self.cfg.data.get("target_physics_couplings", None),
+                "tchannel_norm": getattr(self, "_tch_norm", None),
+                "offshell_stats": getattr(self, "_offshell_stats", None),
+                "prepd_mean": [float(x) for x in self.prepd_mean],
+                "prepd_std":  [float(x) for x in self.prepd_std],
+            }, f, indent=2)
+        LOGGER.info(f"Saved frozen data stats to {stats_path}")
+
+    def _signedlog_quantile(self):
+        """Quantile of |x| that sets the signed-log scale (data.signedlog_quantile)."""
+        return float(self.cfg.data.get("signedlog_quantile", SIGNEDLOG_QUANTILE))
+
+    def _signedlog_scale_shift(self):
+        """Shift (nat) of the signed-log scale off its quantile, s -> s exp(shift) (data.signedlog_scale_shift, default
+        0): the signed pools' A/B, r0 three nats below the pool's level (docs/results.tex, the candidate targets)."""
+        return float(self.cfg.data.get("signedlog_scale_shift", 0.0) or 0.0)
+
+    def _init_dataloader(self):
+        from dataset import (AmplitudeDataset, collate_variable_length, ProcessBalancedSampler,
+                             PerProcessMicroBatchSampler, RoundRobinMicroBatchSampler)
+
+        N_total = self.N_events
+        mm = getattr(self, "_mmap_dir", None) is not None    # data.memmap (data_mmap.py)
+
+        role_counts = getattr(self, "_role_counts", None)
+        if role_counts is not None:
+            # Recipe data path: explicit, role-contiguous train|val|test pools
+            # (no positional ratio split).
+            n_train, n_val, n_test = role_counts
+            if mm and not (getattr(self, "_monitor_pids", []) or self.cfg.training.get("use_balanced_sampler", False)
+                           or self._accumulation_mode(self.cfg.training.get("per_process_accumulation", False))):
+                # data.memmap: the train split is rows [0, n_train) of the maps, never materialised (8 B per event)
+                train_idx = range(0, n_train)
+            else:
+                train_idx = np.arange(0,                 n_train)
+            val_idx   = np.arange(n_train,           n_train + n_val)
+            test_idx  = np.arange(n_train + n_val,   n_train + n_val + n_test)
+            with open_dict(self.cfg):
+                self.cfg.data.subsample = n_train
+        else:
+            assert sum(self.cfg.data.train_test_val) <= 1
+
+            n_train = int(N_total * self.cfg.data.train_test_val[0])
+            if n_train % 2 != 0 and n_train > 1:
+                n_train -= 1
+            elif n_train == 1:
+                n_train = 2
+
+            # Store as scalar for base_experiment._evals compatibility
+            with open_dict(self.cfg):
+                self.cfg.data.subsample = n_train
+
+            val_ratio = self.cfg.data.train_test_val[2] / self.cfg.data.train_test_val[0]
+            n_val = max(int(n_train * val_ratio), 2)
+            if n_val % 2 != 0:
+                n_val -= 1
+
+            train_idx = np.arange(0,       n_train)
+            val_idx   = np.arange(n_train, n_train + n_val)
+            test_idx  = np.arange(n_train + n_val, N_total)
+
+        mon = getattr(self, "_monitor_pids", [])
+        if mon:
+            pid = self.all_process_ids[train_idx]
+            keep = ~np.isin(pid, mon)
+            n_buf = 0
+            for i in mon:
+                k = int(self._recipe_specs[i].get("train_events", 0))
+                if k > 0:   # the split is shuffled (seed 42): its first k events of the process are a random subset
+                    sel = np.flatnonzero(pid == i)[:k]
+                    keep[sel] = True
+                    n_buf += len(sel)
+            LOGGER.info(f"monitor processes {self._monitor_names}: {int((~keep).sum())} train events left out of "
+                        f"training, {n_buf} kept as a replay buffer; outside the checkpoint-selecting aggregate")
+            train_idx = train_idx[keep]
+            n_train = len(train_idx)
+            with open_dict(self.cfg):
+                self.cfg.data.subsample = n_train     # the events actually trained on
+            if bool(self.cfg.training.get("use_balanced_sampler", False)):
+                raise ValueError("monitor processes and training.use_balanced_sampler are exclusive: the "
+                                 "balanced sampler's weights run over every dataset, monitors have no train events")
+
+        nw = self.cfg.training.num_workers
+
+        def make_dataset(indices):
+            if mm:
+                from data_mmap import MmapAmplitudeDataset
+                return MmapAmplitudeDataset(self._mmap_src, self.all_amplitudes, self.all_process_ids, self.dtype,
+                                            indices)
+            return AmplitudeDataset(
+                particles_flat = self.particles_flat,
+                offsets        = self.offsets[indices],
+                amplitudes     = self.all_amplitudes[indices],
+                tokens_flat    = self.tokens_flat,
+                order_labels   = self.all_order_labels[indices],
+                process_ids    = self.all_process_ids[indices],
+                dtype          = self.dtype,
+            )
+
+        def make_loader(indices, shuffle, batchsize, sampler=None, workers=None, drop_last=True):
+            # workers defaults to nw (cfg.training.num_workers); eval / per-process loaders
+            # pass workers=0 so the large in-memory dataset isn't forked into many worker
+            # sets (one per loader), whose copy-on-write pages creep the RSS up.
+            #
+            # pin_memory=False (NOT w>0): batches are variable-length (the collated particle
+            # tensor size differs every step), so a pinned-memory caching allocator hoards a
+            # distinct page-locked buffer per distinct size -> host RAM grows unbounded ->
+            # OOM over a long run. This is independent of workers/persistence (it bit every
+            # config). Dropping pin_memory removes the pinned cache; the H2D copy is then
+            # sync, but it's tiny (~1 MB/batch) next to compute, and the worker collate
+            # overlap (the real speedup) is unaffected. persistent_workers stays True so
+            # workers are never respawned mid-run (respawning leaks semaphores/procs and
+            # progressively slows the run).
+            ds = make_dataset(indices)
+            w = nw if workers is None else workers
+            if mm and shuffle and sampler is None:
+                # RandomSampler's batches without its per-epoch Python list of every index (data_mmap.py)
+                from data_mmap import RandomBatchSampler
+                return torch.utils.data.DataLoader(
+                    ds, batch_sampler=RandomBatchSampler(len(ds), batchsize, drop_last),
+                    collate_fn=collate_variable_length, pin_memory=False, num_workers=w,
+                    persistent_workers=w > 0)
+            return torch.utils.data.DataLoader(
+                ds,
+                batch_size  = batchsize,
+                shuffle     = shuffle if sampler is None else False,
+                sampler     = sampler,
+                drop_last   = drop_last,
+                collate_fn  = collate_variable_length,
+                pin_memory         = False,
+                num_workers        = w,
+                persistent_workers = w > 0,
+            )
+
+        self.cfg.training.batchsize = int(min(self.cfg.training.batchsize, n_train / 2))
+        batchsize = self.cfg.training.batchsize
+
+        # --- training loader: equal (uniform) sampler by default; opt-in balanced ---
+        # The ProcessBalancedSampler was tried and discarded as a default (benefit
+        # dilutes with many datasets, perturbing the sampling dynamics hurts); it stays
+        # available via training.use_balanced_sampler for few, very unbalanced datasets.
+        use_balanced = bool(self.cfg.training.get("use_balanced_sampler", False))
+        self._accum_mode = self._accumulation_mode(self.cfg.training.get("per_process_accumulation", False))
+        self._per_process_accum = self._accum_mode is not None
+        assert not (self._per_process_accum and int(self.cfg.training.get("batch_accumulation", 1)) > 1), \
+            "training.batch_accumulation > 1 with per_process_accumulation: _step would take the per-process path alone"
+        if self._accum_mode == "round_robin":
+            # arXiv:2606.23791's batching: G single-process micro-batches of B events per
+            # optimizer step, processes in round-robin order; gradient = per-event mean over the
+            # G*B events (_round_robin_step_grads). The loader yields one step's G micro-batches
+            # collated together.
+            if use_balanced:
+                raise ValueError("training.per_process_accumulation and use_balanced_sampler "
+                                 "are exclusive (the former fixes every process's share)")
+            train_proc_ids = self.all_process_ids[train_idx]
+            G = self.cfg.training.get("accumulation_steps", None)
+            G = int(G) if G not in (None, "null", "none") else 4
+            micro = self.cfg.training.get("accumulation_microbatch", None)
+            micro = int(micro) if micro not in (None, "null", "none") else max(1, batchsize // G)
+            order = str(self.cfg.training.get("accumulation_order", "interleaved") or "interleaved")
+            with open_dict(self.cfg):
+                self.cfg.training.accumulation_steps = G
+                self.cfg.training.accumulation_microbatch = micro
+                self.cfg.training.accumulation_order = order
+            seed = self.cfg.get("seed", None)
+            self.train_sampler = None
+            self._accum_sampler = RoundRobinMicroBatchSampler(
+                train_proc_ids, micro, G, order=order, seed=int(seed) if seed is not None else 0)
+            ds = make_dataset(train_idx)
+            self.train_loader = torch.utils.data.DataLoader(
+                ds, batch_sampler=self._accum_sampler, collate_fn=collate_variable_length,
+                pin_memory=False, num_workers=nw, persistent_workers=nw > 0,
+            )
+            capped = {p: m for p, m in self._accum_sampler.m.items() if m < micro}
+            LOGGER.info(
+                f"Round-robin per-process accumulation (arXiv:2606.23791): {G} single-process "
+                f"micro-batches of {micro} events per optimizer step ({G * micro} events/update), "
+                f"order {order} over {len(self._accum_sampler.procs)} processes; gradient = "
+                f"per-event mean over the step's events (training.loss_aggregation is not used "
+                f"for the gradient in this mode); {len(capped)} processes capped at their pool size"
+                + (f" {capped}" if capped else "")
+            )
+        elif self._accum_mode == "all_processes":
+            # one single-process micro-batch per process per step, gradients accumulated
+            # (_per_process_step_grads); the loader yields them collated and grouped by process
+            if use_balanced:
+                raise ValueError("training.per_process_accumulation and use_balanced_sampler "
+                                 "are exclusive (the former fixes every process's share)")
+            train_proc_ids = self.all_process_ids[train_idx]
+            n_proc_train = len(np.unique(train_proc_ids))
+            micro = self.cfg.training.get("accumulation_microbatch", None)
+            micro = int(micro) if micro not in (None, "null", "none") else max(1, batchsize // n_proc_train)
+            with open_dict(self.cfg):
+                self.cfg.training.accumulation_microbatch = micro
+            seed = self.cfg.get("seed", None)
+            self.train_sampler = None   # the balanced-sampler hooks (weights, snapshots) don't apply
+            self._accum_sampler = PerProcessMicroBatchSampler(
+                train_proc_ids, micro, seed=int(seed) if seed is not None else 0)
+            ds = make_dataset(train_idx)
+            self.train_loader = torch.utils.data.DataLoader(
+                ds, batch_sampler=self._accum_sampler, collate_fn=collate_variable_length,
+                pin_memory=False, num_workers=nw, persistent_workers=nw > 0,
+            )
+            capped = sum(1 for m in self._accum_sampler.m.values() if m < micro)
+            LOGGER.info(
+                f"Per-process gradient accumulation: {n_proc_train} micro-batches of {micro} "
+                f"events per step ({self._accum_sampler.events_per_step} events/update; "
+                f"{capped} processes capped at their pool size), one optimizer step per iteration"
+            )
+        elif self.n_datasets > 1 and use_balanced:
+            train_proc_ids = self.all_process_ids[train_idx]
+            self.train_sampler = ProcessBalancedSampler(
+                process_ids = train_proc_ids,
+                batch_size  = batchsize,
+                seed        = 0,
+            )
+            self.train_loader = make_loader(train_idx, shuffle=False,
+                                            batchsize=batchsize,
+                                            sampler=self.train_sampler)
+            LOGGER.info(
+                f"Using ProcessBalancedSampler across {self.n_datasets} processes "
+                f"(batch_size={batchsize})"
+            )
+        else:
+            self.train_sampler = None
+            self.train_loader  = make_loader(train_idx, shuffle=True, batchsize=batchsize)
+            if self.n_datasets > 1:
+                LOGGER.info(
+                    f"Using equal/uniform sampler across {self.n_datasets} processes "
+                    f"(batch_size={batchsize})"
+                )
+
+        # Plain train loader for evaluation — always reflects the true data distribution,
+        # regardless of whether a balanced sampler is used for training. Capped per process
+        # by evaluation.train_subsample (train_idx is already shuffled, so the first N of a
+        # process are a random subset): the train-split pass is for the train-side metrics
+        # and plots only, and over the whole pool it took longer than the training it
+        # followed (35 min for 42.7M events after a 20-min catalog_2 run).
+        _tcap = self.cfg.evaluation.get("train_subsample", None)
+        _tcap = int(_tcap) if _tcap not in (None, "null", "none") else None
+        train_eval_idx = train_idx if (_tcap is None or self.n_datasets > 1) else train_idx[:_tcap]
+        # batch size from the CAPPED index set: with drop_last a batch larger than the
+        # capped split yields zero batches and the evaluation has nothing to concatenate
+        train_eval_bs = min(self.cfg.evaluation.batchsize, max(len(train_eval_idx) // 2, 1))
+        # The combined eval loaders keep their last partial batch (drop_last=False): the
+        # LLoCa validation and evaluation run over them once and split per process by
+        # process id, so every process's events must be present.
+        self.train_eval_loader = make_loader(train_eval_idx, shuffle=False, batchsize=train_eval_bs,
+                                             workers=0, drop_last=False)
+
+        self._split_indices = {"train": train_eval_idx, "val": val_idx, "test": test_idx}
+        eval_bs = min(self.cfg.evaluation.batchsize, max(len(val_idx) // 2, 1))
+        self.val_loader  = make_loader(val_idx,  shuffle=False, batchsize=eval_bs, workers=0,
+                                       drop_last=False)
+        self.test_loader = make_loader(test_idx, shuffle=False,
+                                       batchsize=min(self.cfg.evaluation.batchsize,
+                                                     max(len(test_idx) // 2, 1)),
+                                       workers=0, drop_last=False)
+
+        # --- per-process loaders (val for loss tracking; test+train for per-dataset plots) ---
+        self.proc_val_loaders        = {}
+        self.proc_test_loaders       = {}
+        self.proc_train_eval_loaders = {}
+        if self.n_datasets > 1:
+            val_proc_ids   = self.all_process_ids[val_idx]
+            test_proc_ids  = self.all_process_ids[test_idx]
+            if isinstance(train_idx, range):
+                # data.memmap: each process's first `_tcap` train rows, read in chunks (train_idx[pid == p][:_tcap])
+                from data_mmap import first_k_per_process
+                train_first = first_k_per_process(self.all_process_ids, train_idx.start, train_idx.stop,
+                                                  self.n_datasets, _tcap)
+            else:
+                train_proc_ids = self.all_process_ids[train_idx]
+            test_bs        = min(self.cfg.evaluation.batchsize, max(len(test_idx) // 2, 1))
+            _capped        = []
+            for p, name in enumerate(self.cfg.data.dataset):
+                # val
+                mask  = val_proc_ids == p
+                p_idx = val_idx[mask]
+                if len(p_idx) >= 2:
+                    self.proc_val_loaders[name] = make_loader(
+                        p_idx, shuffle=False,
+                        batchsize=min(eval_bs, max(len(p_idx) // 2, 1)),
+                        workers=0,
+                    )
+                    LOGGER.info(f"  Per-process val loader '{name}': {len(p_idx)} events")
+                # test
+                mask  = test_proc_ids == p
+                p_idx = test_idx[mask]
+                if len(p_idx) >= 2:
+                    self.proc_test_loaders[name] = make_loader(
+                        p_idx, shuffle=False,
+                        batchsize=min(test_bs, max(len(p_idx) // 2, 1)),
+                        workers=0,
+                    )
+                # train (plain, for evaluation only; capped per process, see above)
+                if isinstance(train_idx, range):
+                    p_idx = train_first[p]
+                else:
+                    mask  = train_proc_ids == p
+                    p_idx = train_idx[mask]
+                if _tcap is not None:
+                    p_idx = p_idx[:_tcap]
+                if len(p_idx) >= 2:
+                    self.proc_train_eval_loaders[name] = make_loader(
+                        p_idx, shuffle=False,
+                        batchsize=min(train_eval_bs, max(len(p_idx) // 2, 1)),
+                        workers=0,
+                    )
+                    _capped.append(p_idx)
+            if _tcap is not None and _capped:
+                # the combined train-split loader mirrors the per-process cap
+                train_eval_idx = np.concatenate(_capped)
+                self._split_indices["train"] = train_eval_idx
+                self.train_eval_loader = make_loader(
+                    train_eval_idx, shuffle=False,
+                    batchsize=min(self.cfg.evaluation.batchsize, max(len(train_eval_idx) // 2, 1)),
+                    workers=0, drop_last=False)
+    
+        self._n_train_events = int(n_train)   # the BNN readout's KL normalization (_reg_term)
+        LOGGER.info(
+            f"Constructed dataloaders: train={n_train}, val={n_val}, "
+            f"test={len(test_idx)} | "
+            f"batches={len(self.train_loader)}/{len(self.val_loader)}/"
+            f"{len(self.test_loader)} | "
+            f"batchsize={self.cfg.training.batchsize} (train), "
+            f"{self.cfg.evaluation.batchsize} (eval)"
+        )
+                
+    def evaluate(self):
+        self.model.eval()
+        if self.cfg.training.optimizer == "ScheduleFree":
+            self.optimizer.eval()
+
+        combined_key = "combined" if len(self.cfg.data.dataset) > 1 else self.cfg.data.dataset[0]
+
+        # Per-process amplitude un-standardization stats. With per-dataset
+        # preprocessing self.prepd_mean is aligned with data.dataset order; with
+        # global preprocessing it is length-1 and every process shares stats[0].
+        per_dataset_amp = len(self.prepd_mean) > 1
+        def _amp_stats(name):
+            if per_dataset_amp:
+                p = list(self.cfg.data.dataset).index(name)
+                return self.prepd_mean[p], self.prepd_std[p]
+            return self.prepd_mean[0], self.prepd_std[0]
+        def _amp_trafo(name):
+            pp = getattr(self, "_amp_trafos_pp", None)
+            if pp:
+                return pp[list(self.cfg.data.dataset).index(name)]
+            return self.cfg.data.amp_trafos
+
+        def collect(loader, **kw):
+            with torch.no_grad():
+                if self.ema is not None:
+                    with self.ema.average_parameters():
+                        return self._collect_predictions(loader, **kw)
+                return self._collect_predictions(loader, **kw)
+
+        # ------------------------------------------------------------------
+        # Collect per-process predictions (single forward pass per process)
+        # ------------------------------------------------------------------
+        proc_preds = {}   # name -> {"train": (pred,truth,sig), "test": ..., "val": ...}
+        proc_factor = {}  # name -> {split: (N,1) per-event target factor} (data.target_propagators)
+        proc_sign = {}    # name -> {split: (N,2) [predicted, true] sign > 0} (training.sign_head)
+        def _raw(name, split, arr, which="truth"):
+            """Raw-space |M|² from a standardized-log array: undo the transform, then divide
+            the target factor out (data.target_propagators) and, with the sign head, apply the
+            true sign to a truth array and the predicted sign to a prediction."""
+            out = undo_preprocess_amplitude(arr, *_amp_stats(name), trafos=_amp_trafo(name))
+            F = proc_factor.get(name, {}).get(split)
+            if F is not None:
+                out = out / F
+            sg = proc_sign.get(name, {}).get(split)
+            if sg is not None:
+                # the true sign always; the predicted sign only where the logit was trained
+                # (the signed pools): a positive pool's logit carries no gradient and its
+                # sign would be arbitrary
+                signed = bool(self._proc_signed[list(self.cfg.data.dataset).index(name)] > 0)
+                if which == "truth" or signed:
+                    col = 1 if which == "truth" else 0
+                    out = out * np.where(sg[:, col], 1.0, -1.0).reshape(out.shape)
+            return out
+
+        loaders_by_split = [
+            ("test",  self.proc_test_loaders),
+            ("train", self.proc_train_eval_loaders),
+            ("val",   self.proc_val_loaders),
+        ]
+        is_lloca = self.modelname in ("LLOCATransformer", "LLOCAMuPTransformer", "MuPLGATr", "MuPLGATrSlim")
+        if is_lloca and self.proc_val_loaders and os.environ.get("LLOCA_VAL", "combined") != "loop":
+            # One forward pass per split over the COMBINED loader (evaluation.batchsize
+            # events per batch), then split the arrays by process id. The per-process
+            # loaders hold at most a few thousand events each, so iterating them meant
+            # ~3 forward passes of ~1000 events per process and split (2900 for the
+            # 478-pool catalog, 95 s of a 1000-step run's 30 min); the combined pass is
+            # ~60 batches per split. Same events, same per-process arrays (the combined
+            # loader keeps drop_last=False and iterates in index order, the per-process
+            # index sets are the same events in the same relative order). LLOCA_VAL=loop
+            # keeps the per-process loop for A/B checks.
+            combined = {"test": self.test_loader, "train": self.train_eval_loader,
+                        "val": self.val_loader}
+            names = list(self.cfg.data.dataset)
+            factors = getattr(self, "all_amp_factor", None)
+            for split, loader_dict in loaders_by_split:
+                LOGGER.info(f"### Evaluating {split} (combined pass, split per process) ###")
+                pred, truth, sigmas, pids, signs = collect(combined[split], return_process_ids=True)
+                # the combined loader iterates its index set in order (shuffle=False,
+                # drop_last=False), so the per-event target factor aligns with the predictions
+                F = factors[self._split_indices[split]] if factors is not None else None
+                if F is not None:
+                    assert F.shape[0] == pred.shape[0], (F.shape, pred.shape)
+                for p, name in enumerate(names):
+                    if name not in loader_dict:
+                        continue
+                    m = pids == p
+                    if m.sum() < 2:
+                        continue
+                    proc_preds.setdefault(name, {})[split] = (
+                        pred[m], truth[m], sigmas[m] if sigmas is not None else None)
+                    if F is not None:
+                        proc_factor.setdefault(name, {})[split] = F[m].reshape(-1, 1)
+                    if signs is not None:
+                        proc_sign.setdefault(name, {})[split] = signs[m]
+        else:
+            if getattr(self, "_sign_head", False) and self.proc_val_loaders:
+                raise NotImplementedError("the per-process evaluation loop does not carry the sign head")
+            if getattr(self, "all_amp_factor", None) is not None and self.proc_val_loaders:
+                LOGGER.warning("target_propagators is on but the per-process evaluation loop carries "
+                               "no per-event factor: raw-space metrics are on the modified target")
+            for split, loader_dict in loaders_by_split:
+                for name, loader in loader_dict.items():
+                    LOGGER.info(f"### Evaluating {split} [{name}] ###")
+                    if name not in proc_preds:
+                        proc_preds[name] = {}
+                    proc_preds[name][split] = collect(loader)
+
+        # ------------------------------------------------------------------
+        # Build combined arrays by concatenation (no second forward pass)
+        # ------------------------------------------------------------------
+        def concat_split(split):
+            available = [n for n in proc_preds if split in proc_preds[n]]
+            if not available:
+                # single-dataset fallback: collect directly. The loaders iterate their index
+                # set in order, so the per-event target factor aligns as in the combined pass,
+                # and the raw-space arrays divide it out and apply the sign head's signs.
+                loader = {"train": self.train_eval_loader,
+                          "val":   self.val_loader,
+                          "test":  self.test_loader}[split]
+                pred, truth, sigmas, _, signs = collect(loader, return_process_ids=True)
+                name = self.cfg.data.dataset[0]
+                factors = getattr(self, "all_amp_factor", None)
+                if factors is not None:
+                    F = factors[self._split_indices[split]]
+                    assert F.shape[0] == pred.shape[0], (F.shape, pred.shape)
+                    proc_factor.setdefault(name, {})[split] = F.reshape(-1, 1)
+                if signs is not None:
+                    proc_sign.setdefault(name, {})[split] = signs
+                # always through _raw: it inverts with this pool's own transform (a single
+                # signed pool is under signedlog, not the global amp_trafos)
+                raw = (_raw(name, split, truth, "truth"), _raw(name, split, pred, "pred"))
+                return pred, truth, sigmas, self.prepd_mean[0], self.prepd_std[0], raw
+            pred   = np.concatenate([proc_preds[n][split][0] for n in available], axis=0)
+            truth  = np.concatenate([proc_preds[n][split][1] for n in available], axis=0)
+            first_sig = proc_preds[available[0]][split][2]
+            sigmas = (np.concatenate([proc_preds[n][split][2] for n in available], axis=0)
+                      if first_sig is not None else None)
+            # Per-event un-standardization stats, in the same concat order, so the
+            # combined raw-amplitude metrics undo each process correctly under
+            # per-dataset preprocessing (no-op broadcast under global).
+            pm = np.concatenate([
+                np.full((proc_preds[n][split][1].shape[0], 1), _amp_stats(n)[0])
+                for n in available], axis=0)
+            ps = np.concatenate([
+                np.full((proc_preds[n][split][1].shape[0], 1), _amp_stats(n)[1])
+                for n in available], axis=0)
+            # The TRANSFORM is per process too (a positive pool under `log`, a signed one
+            # under `signedlog:<s>` with its own scale), so the combined raw-space arrays
+            # are assembled from per-process inverses rather than undone with one list.
+            raw_truth = np.concatenate([_raw(n, split, proc_preds[n][split][1], "truth") for n in available], axis=0)
+            raw_pred  = np.concatenate([_raw(n, split, proc_preds[n][split][0], "pred") for n in available], axis=0)
+            return pred, truth, sigmas, pm, ps, (raw_truth, raw_pred)
+
+        # ------------------------------------------------------------------
+        # Compute metrics (pure numpy, fast)
+        # ------------------------------------------------------------------
+        LOGGER.info("### Computing combined metrics ###")
+        for split, attr in [("train", "results_train"), ("val", "results_val"), ("test", "results_test")]:
+            pred, truth, sigmas, pm, ps, raw = concat_split(split)
+            setattr(self, attr,
+                    self._metrics_from_arrays(pred, truth, split, combined_key, sigmas,
+                                              prepd_mean=pm, prepd_std=ps, raw_arrays=raw))
+
+        self.results = {
+            combined_key: {
+                "train": self.results_train[combined_key],
+                "val":   self.results_val[combined_key],
+                "test":  self.results_test[combined_key],
+            }
+        }
+
+        # Per-process results for per-dataset histogram plots
+        self.results_per_proc = {}
+        for name, splits in proc_preds.items():
+            self.results_per_proc[name] = {}
+            pm, ps = _amp_stats(name)
+            tr = _amp_trafo(name)
+            for split, (pred, truth, sigmas) in splits.items():
+                self.results_per_proc[name][split] = self._metrics_from_arrays(
+                    pred, truth, f"{split}_{name}", name, sigmas,
+                    prepd_mean=pm, prepd_std=ps, prepd_trafos=tr,
+                    raw_arrays=(_raw(name, split, truth, "truth"), _raw(name, split, pred, "pred")),
+                )[name]
+
+        # evaluation.save_predictions: dump the per-event (prediction, truth) pairs on the
+        # standardized target per split, with the process id and the raw truth, to
+        # preds_<split>.npz in the run dir, for analyses that need the residual per event
+        # (its dependence on the target's own scale, on sqrt(s), ...).
+        if bool(self.cfg.evaluation.get("save_predictions", False)):
+            names = list(self.cfg.data.dataset)
+            for split in ("val", "test", "train"):
+                have = [n for n in names if n in proc_preds and split in proc_preds[n]]
+                if not have and self.n_datasets == 1:
+                    # a single process never fills proc_preds (no per-process loaders): take the
+                    # single-dataset pass concat_split falls back to. The events come in the
+                    # split's shuffled order (seed 42), not the pool's; pool_row maps each back
+                    # to its row in the split's pool file (the loaders iterate each split in order)
+                    pred, truth, sig, _, _, (raw_truth, raw_pred) = concat_split(split)
+                    perm = getattr(self, "_role_perm", {}).get(split)
+                    extra = dict(pool_row=perm[:pred.shape[0]]) if perm is not None else {}
+                    if sig is not None:          # HETEROSC: the per-event sigma, standardized units, for the pulls
+                        extra["sigma"] = sig
+                    out = os.path.join(self.cfg.run_dir, f"preds_{split}.npz")
+                    np.savez_compressed(out, pred=pred, truth=truth, raw_truth=raw_truth, raw_pred=raw_pred,
+                                        process_id=np.zeros(pred.shape[0], int), names=np.array(names[:1]), **extra)
+                    LOGGER.info(f"Saved {pred.shape[0]} {split} predictions to {out}")
+                    continue
+                if not have:
+                    continue
+                pid = np.concatenate([np.full(proc_preds[n][split][1].shape[0], names.index(n)) for n in have])
+                pred = np.concatenate([proc_preds[n][split][0] for n in have], axis=0)
+                truth = np.concatenate([proc_preds[n][split][1] for n in have], axis=0)
+                raw_truth = np.concatenate([_raw(n, split, proc_preds[n][split][1]) for n in have], axis=0)
+                out = os.path.join(self.cfg.run_dir, f"preds_{split}.npz")
+                extra = {}
+                if proc_sign:
+                    extra["sign"] = np.concatenate([proc_sign[n][split] for n in have], axis=0)   # (N,2) [pred, true] > 0
+                if proc_preds[have[0]][split][2] is not None:   # HETEROSC: per-event sigma, standardized units
+                    extra["sigma"] = np.concatenate([proc_preds[n][split][2] for n in have], axis=0)
+                np.savez_compressed(out, pred=pred, truth=truth, raw_truth=raw_truth,
+                                    raw_pred=np.concatenate([_raw(n, split, proc_preds[n][split][0], "pred") for n in have], axis=0),
+                                    process_id=pid, names=np.array(names), **extra)
+                LOGGER.info(f"Saved {pred.shape[0]} {split} predictions to {out}")
+
+        # Optionally log noema metrics (no extra forward pass — just re-use arrays)
+        if self.ema is not None:
+            LOGGER.info("### Evaluating without EMA (reusing predictions not possible — skipping noema) ###")
+
+        return self.results
+
+    def call_model_fn(self, x, tokens=None):
+        if self.modelname in ("LLOCATransformer", "LLOCAMuPTransformer", "MuPLGATr", "MuPLGATrSlim"):
+            if tokens is None:
+                raise ValueError("call_model_fn requires tokens for LLoCA models")
+            return self.model(
+                x.to(self.device),
+                type_token=tokens.to(self.device),
+                mean=self.mom_mean[0],
+                std=self.mom_std[0],
+            )
+        else:
+            return self.model(
+                x.to(self.device),
+                type_token=torch.tensor(
+                    [self.type_token[0]],
+                    dtype=torch.long,
+                    device=self.device,
+                ),
+                global_token=torch.tensor(
+                    [0],
+                    dtype=torch.long,
+                    device=self.device,
+                ),
+            )
+
+    def _collect_predictions(self, loader, return_process_ids=False):
+        """Run model forward pass over a loader.
+
+        Caller is responsible for torch.no_grad() and EMA context.
+
+        Returns
+        -------
+        amp_pred_prepd  : np.ndarray  (N, 1)
+        amp_truth_prepd : np.ndarray  (N, 1)
+        sigmas          : np.ndarray | None   (only for HETEROSC loss)
+        process_ids     : np.ndarray  (N,)  only with return_process_ids=True
+        """
+        is_lloca  = self.modelname in ("LLOCATransformer", "LLOCAMuPTransformer", "MuPLGATr", "MuPLGATrSlim")
+        all_pred  = []
+        all_truth = []
+        all_sigma = [] if self.cfg.training.loss == "HETEROSC" else None
+        all_pids  = [] if return_process_ids else None
+        all_signs = []          # (N,2) bool [predicted sign > 0, true sign > 0] with the sign head
+
+        t0 = time.time()
+        for data in loader:
+            particles, y, tokens, order_labels, ptr, process_ids = data
+            if is_lloca:
+                particles    = particles.to(self.device)
+                tokens       = tokens.to(self.device)
+                order_labels = order_labels.to(self.device)
+                ptr          = ptr.to(self.device)
+                process_ids  = process_ids.to(self.device)
+                y_pred = self.model(
+                    particles, tokens,
+                    mean=self.mom_mean[0], std=self.mom_std[0],
+                    ptr=ptr, order_labels=order_labels,
+                    process_ids=process_ids,
+                )
+            else:
+                x      = particles.to(self.device)
+                tokens = tokens.to(self.device)
+                B, nparticles_max = tokens.shape
+                is_real = tokens != 0
+                neg_inf = torch.finfo(self.dtype).min
+                attn_mask = torch.full(
+                    (B, 1, 1, 1 + nparticles_max, 1 + nparticles_max),
+                    neg_inf, dtype=self.dtype, device=self.device,
+                )
+                real_with_global = torch.cat(
+                    [torch.ones(B, 1, dtype=torch.bool, device=self.device), is_real], dim=1
+                )
+                allowed = real_with_global.unsqueeze(2) & real_with_global.unsqueeze(1)
+                attn_mask[:, 0, 0, :, :] = torch.where(
+                    allowed,
+                    torch.zeros(1, dtype=self.dtype, device=self.device),
+                    attn_mask[:, 0, 0, :, :],
+                )
+                if self.modelname == "LGATr":
+                    x = x.unsqueeze(0)
+                y_pred = self.model(
+                    x,
+                    type_token=tokens,
+                    global_token=torch.zeros(B, dtype=torch.long, device=self.device),
+                    attn_mask=attn_mask,
+                )
+                if self.modelname == "LGATr" and y_pred.shape[0] == 1:
+                    y_pred = y_pred.squeeze(0)
+
+            out_shape = (
+                self.cfg.model.net.get("out_shape")
+                or self.cfg.model.net.get("out_channels")
+            )
+            if self.cfg.training.loss == "HETEROSC":
+                all_sigma.append(y_pred[..., -out_shape:].cpu().float().numpy())
+                y_pred = y_pred[..., :-out_shape]
+            if getattr(self, "_sign_head", False):
+                all_signs.append(np.stack([(y_pred[..., -1] > 0).cpu().numpy(),
+                                           (y[..., 1] > 0.5).cpu().numpy()], axis=1))
+                y_pred, y = y_pred[..., :-1], y[..., :1]
+
+            all_pred.append(y_pred[:, :1].cpu().float().numpy() if not is_lloca
+                            else y_pred.cpu().float().numpy())
+            all_truth.append(y.cpu().float().numpy())
+            if all_pids is not None:
+                all_pids.append(np.asarray(process_ids.cpu().numpy()).reshape(-1))
+
+        LOGGER.info(
+            f"Collected {sum(len(p) for p in all_pred)} predictions in {time.time()-t0:.2f}s"
+        )
+        amp_pred_prepd  = np.concatenate(all_pred,  axis=0)
+        amp_truth_prepd = np.concatenate(all_truth, axis=0)
+        sigmas = np.concatenate(all_sigma, axis=0) if all_sigma else None
+        if return_process_ids:
+            signs = np.concatenate(all_signs, axis=0) if all_signs else None
+            return amp_pred_prepd, amp_truth_prepd, sigmas, np.concatenate(all_pids, axis=0), signs
+        return amp_pred_prepd, amp_truth_prepd, sigmas
+
+    def _metrics_from_arrays(self, amp_pred_prepd, amp_truth_prepd, title, result_key,
+                             sigmas=None, prepd_mean=None, prepd_std=None, prepd_trafos=None,
+                             raw_arrays=None):
+        """Compute metrics from preprocessed arrays (no model call). Pure numpy.
+
+        `raw_arrays=(truth, pred)` supplies the raw-space arrays already inverted
+        (per process, when the transform differs between processes) and skips the
+        inverse here.
+
+        `prepd_mean`/`prepd_std` override the standardization stats used to undo
+        the amplitude preprocessing. They may be scalars or per-event arrays
+        (broadcastable to amp shape) — needed when amplitudes were preprocessed
+        per-dataset, so each event is un-standardized with its own process's
+        stats. Default to the global stats (self.prepd_mean[0])."""
+        if prepd_mean is None:
+            prepd_mean = self.prepd_mean[0]
+        if prepd_std is None:
+            prepd_std = self.prepd_std[0]
+        if prepd_trafos is None:
+            prepd_trafos = self.cfg.data.amp_trafos
+        mse_prepd    = np.mean((amp_pred_prepd - amp_truth_prepd) ** 2)
+        l1_prepd     = np.mean(np.abs(amp_pred_prepd - amp_truth_prepd))
+        l1_rel_prepd = np.mean(
+            np.abs(amp_pred_prepd - amp_truth_prepd)
+            / np.maximum(np.abs(amp_truth_prepd), 1e-8)
+        )
+        LOGGER.info(f"MSE (prepd) {title} {result_key}: {mse_prepd:.4e}")
+        LOGGER.info(f"L1  (prepd) {title} {result_key}: {l1_prepd:.4e}")
+        LOGGER.info(f"L1r (prepd) {title} {result_key}: {l1_rel_prepd:.4e}")
+
+        if raw_arrays is not None:
+            amp_truth, amp_pred = raw_arrays
+        else:
+            amp_truth = undo_preprocess_amplitude(
+                amp_truth_prepd, prepd_mean, prepd_std, trafos=prepd_trafos,
+            )
+            amp_pred = undo_preprocess_amplitude(
+                amp_pred_prepd, prepd_mean, prepd_std, trafos=prepd_trafos,
+            )
+
+        mse    = np.mean((amp_truth - amp_pred) ** 2)
+        l1     = np.mean(np.abs(amp_truth - amp_pred))
+        l1_rel = np.mean(np.abs(amp_truth - amp_pred) / np.abs(amp_truth))
+        delta     = (amp_truth - amp_pred) / amp_truth
+        delta_abs = np.abs(delta)
+        LOGGER.info(f"Mean |rel err| {title} {result_key}: {np.mean(delta_abs):.4f}")
+
+        delta_maxs  = [1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2]
+        delta_rates = [np.mean((delta > -dm) * (delta < dm)) for dm in delta_maxs]
+        LOGGER.info(
+            f"rate of events in delta interval on {result_key} {title}:\t"
+            f"{[f'{delta_rates[i]:.4f} ({delta_maxs[i]})' for i in range(len(delta_maxs))]}"
+        )
+
+        idx = np.argsort(np.abs(amp_truth))
+        LOGGER.info(
+            f"Mean |rel err| on 1%% largest amplitudes {result_key} {title}: "
+            f"{np.mean(delta_abs[idx]):.4f}"
+        )
+
+        amp = {
+            "raw": {
+                "truth":      amp_truth,
+                "prediction": amp_pred,
+                "mse":        mse,
+                "l1":         l1,
+                "l1_rel":     l1_rel,
+            },
+            "preprocessed": {
+                "truth":      amp_truth_prepd,
+                "prediction": amp_pred_prepd,
+                "mse":        mse_prepd,
+                "l1":         l1_prepd,
+                "l1_rel":     l1_rel_prepd,
+            },
+        }
+        if sigmas is not None:
+            pull = (amp_truth_prepd - amp_pred_prepd) / sigmas
+            amp["preprocessed"]["sigmas"] = sigmas
+            amp["preprocessed"]["pull"]   = pull
+
+        return {result_key: amp}
+
+    def _evaluate_single(self, loader, title):
+        """Thin wrapper kept for backward compatibility (e.g. base_experiment._evals)."""
+        LOGGER.info(f"### Starting to evaluate model on {title} dataset ###")
+        self.model.eval()
+        if self.cfg.training.optimizer == "ScheduleFree":
+            self.optimizer.eval()
+        result_key = (
+            "combined" if len(self.cfg.data.dataset) > 1 else self.cfg.data.dataset[0]
+        )
+        with torch.no_grad():
+            pred, truth, sigmas = self._collect_predictions(loader)
+        return self._metrics_from_arrays(pred, truth, title, result_key, sigmas)
+
+    def plot(self):
+        plot_path = os.path.join(self.cfg.run_dir, f"plots_{self.cfg.run_idx}")
+        os.makedirs(plot_path, exist_ok=True)
+        dataset_titles = [
+            "combined" if len(self.cfg.data.dataset) > 1 else short_ds_name(self.cfg.data.dataset[0])
+        ]
+        model_core = self.model.module if isinstance(self.model, torch.nn.parallel.DistributedDataParallel) else self.model
+        model_title = MODEL_TITLE_DICT[type(model_core.net).__name__]   
+        #model_title = MODEL_TITLE_DICT[type(self.model.net).__name__]
+        title = [f"{model_title}: {dataset_title}" for dataset_title in dataset_titles]
+        LOGGER.info(f"Creating plots in {plot_path}")
+
+        plot_dict = {}
+        if self.cfg.evaluate:
+            plot_dict["results_test"]     = self.results_test
+            plot_dict["results_train"]    = self.results_train
+            plot_dict["results_per_proc"] = getattr(self, "results_per_proc", {})
+        if self.cfg.train:
+            plot_dict["train_loss"]        = self.train_loss
+            plot_dict["val_loss"]          = self.val_loss
+            plot_dict["train_lr"]          = self.train_lr
+            plot_dict["train_loss_no_reg"] = getattr(self, "train_loss_no_reg", [])
+            plot_dict["val_loss_no_reg"]   = getattr(self, "val_loss_no_reg",   [])
+            plot_dict["train_mse"]         = getattr(self, "train_mse",         [])
+            plot_dict["val_mse"]           = getattr(self, "val_mse",           [])
+            plot_dict["proc_val_losses"]        = getattr(self, "proc_val_losses",        {})
+            plot_dict["proc_val_losses_no_reg"] = getattr(self, "proc_val_losses_no_reg", {})
+            plot_dict["proc_ema_losses"]        = getattr(self, "_proc_ema_losses",        {})
+            plot_dict["proc_ema_losses_no_reg"] = getattr(self, "_proc_ema_losses_no_reg", {})
+            plot_dict["validate_every_n_steps"] = self.cfg.training.validate_every_n_steps
+            # per-process cumulative compute (samples seen) at each validation step;
+            # list[dict{proc_id: n_samples}], aligned with proc_val_losses.
+            plot_dict["proc_compute_snapshots"] = (
+                self.train_sampler.compute_snapshots if self.train_sampler is not None else []
+            )
+            plot_dict["dataset_order"] = list(self.cfg.data.dataset)
+            # solo scaling reference {dataset: [a, b]} for the vs-compute overlay
+            dp = (self.cfg.data.get("data_path", "") or "")
+            solo_path = os.path.join(dp, "solo_scaling.json") if dp else None
+            try:
+                if solo_path and os.path.exists(solo_path):
+                    plot_dict["solo_scaling"] = json.load(open(solo_path))
+            except Exception as e:
+                LOGGER.warning(f"Could not load solo_scaling reference ({solo_path}): {e}")
+
+        self._save_per_process_metrics(plot_path)
+        plot_mixer(self.cfg, plot_path, title, plot_dict)
+
+    def _save_per_process_metrics(self, plot_path):
+        """Dump per-process validation metrics to JSON for later reconstruction.
+
+        Saves the raw per-dataset val losses (with/without reg), the EMA-smoothed
+        series the sampler fits α on, the per-dataset cumulative compute, and the
+        combined val losses — enough to rebuild the global loss, the EMA curves,
+        and the loss-vs-compute scaling offline.
+        """
+        if not self.cfg.train or not getattr(self, "proc_val_losses", {}):
+            return
+        dataset_order = list(self.cfg.data.dataset)
+        snapshots = (
+            self.train_sampler.compute_snapshots if self.train_sampler is not None else []
+        )
+        proc_compute = {
+            name: [int(s.get(i, 0)) for s in snapshots]
+            for i, name in enumerate(dataset_order)
+        }
+
+        def _f(seq):
+            return [float(v) for v in seq]
+
+        def _fd(d):
+            return {k: _f(v) for k, v in d.items()}
+
+        dump = {
+            "validate_every_n_steps": self.cfg.training.validate_every_n_steps,
+            "dataset_order": dataset_order,
+            "val_loss": _f(self.val_loss),
+            "val_loss_no_reg": _f(getattr(self, "val_loss_no_reg", [])),
+            "val_loss_no_reg_all": _f(getattr(self, "val_loss_no_reg_all", [])),
+            "monitor_processes": list(getattr(self, "_monitor_names", [])),
+            "proc_val_losses": _fd(self.proc_val_losses),
+            "proc_val_losses_no_reg": _fd(getattr(self, "proc_val_losses_no_reg", {})),
+            "proc_ema_losses": _fd(getattr(self, "_proc_ema_losses", {})),
+            "proc_ema_losses_no_reg": _fd(getattr(self, "_proc_ema_losses_no_reg", {})),
+            "proc_compute": proc_compute,
+            "proc_status": getattr(self, "_ds_status_hist", {}),
+        }
+        out_path = os.path.join(plot_path, "per_process_metrics.json")
+        with open(out_path, "w") as f:
+            json.dump(dump, f)
+        LOGGER.info(f"Saved per-process metrics to {out_path}")
+
+    def _init_loss(self):
+        match self.cfg.training.loss:
+            case "MSE":
+                self.loss = torch.nn.MSELoss()
+                LOGGER.info("Using MSE loss")
+            case "L1":
+                self.loss = torch.nn.L1Loss()
+                LOGGER.info("Using L1 loss")
+            case "LogCosh":
+                self.loss = LogCoshLoss()
+                LOGGER.info("Using LogCosh loss")
+            case "RelL1":
+                self.loss = RelL1Loss()
+                LOGGER.info("Using RelL1 loss")
+            case "HETEROSC":
+                self.loss = HeteroscedasticLoss()
+                LOGGER.info("Using Heteroscedastic loss")
+            case _:
+                raise ValueError(f"Unknown loss function {self.cfg.training.loss}")
+            
+    def _init_regularization(self):
+        self.regularization_lambda = self.cfg.training.regularization_lambda
+        # The naive `sum(p.pow(2).sum() for p in model.parameters())` launches one
+        # pow + one reduction kernel (plus a full-size temporary) per parameter
+        # tensor and chains the adds in Python — ~100+ tiny serialized kernels every
+        # step for an 8-block transformer, independent of width. torch._foreach_norm
+        # fuses all tensors into a handful of multi-tensor kernels (the same
+        # machinery clip_grad_norm_ uses). Set LLOCA_REG=loop for the old path.
+        use_loop = os.environ.get("LLOCA_REG", "foreach") == "loop"
+        match self.cfg.training.regularization:
+            case "L2":
+                if use_loop:
+                    self.regularization = lambda model: sum(param.pow(2.0).sum() for param in _reg_params(model))
+                else:
+                    # sum of squared L2 norms == sum of squares of all params.
+                    # norm-then-square introduces a tiny float rounding difference
+                    # vs. pow(2).sum() — negligible for a regularization term.
+                    self.regularization = lambda model: torch.stack(
+                        torch._foreach_norm(_reg_params(model))
+                    ).square().sum()
+            case "L1":
+                if use_loop:
+                    self.regularization = lambda model: sum(param.abs().sum() for param in _reg_params(model))
+                else:
+                    # L1 norm per tensor (ord=1), summed → sum of |p| over all params (exact).
+                    self.regularization = lambda model: torch.stack(
+                        torch._foreach_norm(_reg_params(model), ord=1)
+                    ).sum()
+            case None:
+                self.regularization = lambda model: 0.0
+            case _:
+                raise ValueError(
+                    f"Unknown regularization function {self.cfg.training.regularization}"
+                )
+
+    def _reg_term(self, model):
+        """The penalty added to the training loss and to the tracked (regularized) val_loss, never to the
+        *_no_reg losses: lambda * L2/L1, plus, with model.net.bayesian_last_layer, the BNN readout's
+        KL(q || prior) / (number of training events) (models/bayesian_readout.py; jetgpt-splittings
+        JetGPT.batch_loss, arlo Bayesian.batch_loss). Without a Bayesian readout this is the plain lambda * reg."""
+        reg = self.regularization_lambda * self.regularization(model)
+        cache = getattr(self, "_bnn_cache", None)
+        if cache is None or cache[0] is not model:
+            from models.bayesian_readout import bayesian_readouts
+            cache = self._bnn_cache = (model, bayesian_readouts(model))
+        if not cache[1]:
+            return reg
+        n_train = int(getattr(self, "_n_train_events", 0))
+        if n_train <= 0:
+            # an evaluation-only tool that never built the train loader: the KL only enters the tracked val_loss
+            assert not model.training, "bayesian_last_layer: the KL term needs the training-event count (_init_dataloader)"
+            return reg
+        return reg + sum(layer.kl() for layer in cache[1]) / n_train
+
+    def _batch_loss(self, data):
+        
+    
+        if self.modelname in ("LLOCATransformer", "LLOCAMuPTransformer", "MuPLGATr", "MuPLGATrSlim"):
+            return self._batch_loss_lloca(data)
+        x, y, tokens = data   # (B, nparticles_max[,4]), (B,1), (B, nparticles_max)
+        x      = x.to(self.device)
+        y      = y.to(self.device)
+        tokens = tokens.to(self.device)   # (B, nparticles_max)
+    
+        B, nparticles_max = tokens.shape
+    
+        # padding mask: True where token == 0 means padding
+        # real particles have token >= 1 (0 is reserved for padding by the tokenizer)
+        is_real = tokens != 0   # (B, nparticles_max)
+    
+        # build float attention mask  (B, 1, 1, 1+P, 1+P)
+        # 0.0 = attend, -inf = ignore
+        neg_inf = torch.finfo(self.dtype).min
+        attn_mask = torch.full(
+            (B, 1, 1, 1 + nparticles_max, 1 + nparticles_max),
+            neg_inf, dtype=self.dtype, device=self.device,
+        )
+        # global token (position 0) can always attend to itself and all real particles
+        real_with_global = torch.cat(
+            [torch.ones(B, 1, dtype=torch.bool, device=self.device), is_real], dim=1
+        )  # (B, 1+P)
+        allowed = real_with_global.unsqueeze(2) & real_with_global.unsqueeze(1)  # (B, 1+P, 1+P)
+        attn_mask[:, 0, 0, :, :] = torch.where(allowed, torch.zeros(1, dtype=self.dtype, device=self.device), attn_mask[:, 0, 0, :, :])
+    
+        if self.modelname == "LGATr":
+            x = x.unsqueeze(0)
+    
+        y_pred = self.model(
+            x,
+            type_token=tokens,
+            global_token=torch.zeros(B, dtype=torch.long, device=self.device),
+            attn_mask=attn_mask,
+        )
+    
+        out_shape = self.cfg.model.net.get("out_shape") or self.cfg.model.net.get("out_channels")
+        if self.cfg.training.loss == "HETEROSC":
+            sigma   = y_pred[..., -out_shape:]
+            y_pred  = y_pred[..., :-out_shape]
+            loss    = self.loss(y_pred, y, sigma)
+            mse_val = torch.nn.functional.mse_loss(y_pred, y).item()
+        else:
+            loss    = self.loss(y_pred, y)
+            mse_val = None
+    
+        reg_term    = self._reg_term(self.model)
+        # Detached tensor (not .item()) — deferred sync; see _batch_loss_lloca / _step.
+        loss_no_reg = loss.detach()
+        loss        = loss + reg_term
+        if os.environ.get("LLOCA_SYNC", "deferred") == "blocking":
+            assert torch.isfinite(loss).all()
+        return loss, loss_no_reg, mse_val
+
+    def _forward_lloca(self, data):
+        """Forward of one collated batch on the LLoCa/L-GATr path.
+
+        Returns (y_pred, y, process_ids, sigma, mse_val): the prediction with the
+        HETEROSC sigma split off (None otherwise), the target, the per-event process
+        ids on the device, and the detached mu-MSE for HETEROSC (None otherwise).
+        Shared by the training loss, the validation pass and the evaluation collector.
+        """
+        particles, y, tokens, order_labels, ptr, process_ids = data
+
+        # Compute the per-event particle counts on the CPU (ptr is born on the CPU
+        # in collate_variable_length) so the attention-mask builder doesn't have to
+        # `.tolist()` the GPU ptr — that sync drains the CUDA queue every forward.
+        # Disabled under LLOCA_SYNC=blocking (original device-ptr path) for A/B.
+        sync_blocking = os.environ.get("LLOCA_SYNC", "deferred") == "blocking"
+        seq_lens = None
+        if not sync_blocking and not ptr.is_cuda:
+            seq_lens = tuple((ptr[1:] - ptr[:-1]).tolist())   # pure-CPU, no GPU sync
+
+        # non_blocking=True overlaps the H2D copy with compute when the source is
+        # pinned (pin_memory engages automatically for num_workers>0); it's a safe
+        # no-op for unpinned/num_workers=0. CUDA stream ordering guarantees the
+        # consuming kernels wait for the copy, so this stays correct.
+        particles    = particles.to(self.device, non_blocking=True)
+        y            = y.to(self.device, non_blocking=True)
+        tokens       = tokens.to(self.device, non_blocking=True)
+        order_labels = order_labels.to(self.device, non_blocking=True)
+        ptr          = ptr.to(self.device, non_blocking=True)
+        process_ids  = process_ids.to(self.device, non_blocking=True)
+
+        y_pred = self.model(
+            particles, tokens,
+            mean         = self.mom_mean[0],
+            std          = self.mom_std[0],
+            ptr          = ptr,
+            order_labels = order_labels,
+            seq_lens     = seq_lens,
+            process_ids  = process_ids,
+        )  # (B, out_channels)
+
+        # HETEROSC: the net emits [mean, sigma]; split sigma out and pass it to the
+        # per-event NLL (the aggregator threads it through to _per_event_loss).
+        sigma = None
+        mse_val = None
+        if self.cfg.training.loss == "HETEROSC":
+            out_shape = self.cfg.model.net.get("out_shape") or self.cfg.model.net.get("out_channels")
+            sigma  = y_pred[..., -out_shape:]
+            y_pred = y_pred[..., :-out_shape]
+        # sign head: last output channel is the sign logit, second target column the sign
+        self._last_sign = None
+        if getattr(self, "_sign_head", False):
+            self._last_sign = (y_pred[..., -1:], y[..., 1:])
+            y_pred, y = y_pred[..., :-1], y[..., :1]
+        if sigma is not None:
+            # β-invariant μ-quality metric (comparable across β and to MSE runs); detached; after the sign split, so
+            # under the sign head it is mu's alone
+            mse_val = torch.nn.functional.mse_loss(y_pred, y).detach()
+        return y_pred, y, process_ids, sigma, mse_val
+
+    def _batch_loss_lloca(self, data):
+        sync_blocking = os.environ.get("LLOCA_SYNC", "deferred") == "blocking"
+        y_pred, y, process_ids, sigma, mse_val = self._forward_lloca(data)
+
+        loss_agg = self.cfg.training.get("loss_aggregation", "mean")
+        loss = self._aggregate_per_process_loss(y_pred, y, process_ids, loss_agg, sigma=sigma,
+                                                sign=self._last_sign)
+
+        reg         = self._reg_term(self.model)
+        # Keep the no-reg loss as a detached tensor instead of syncing here with
+        # .item() *before backward* — that sync forces the whole forward to finish
+        # and the CPU to wait before backward is even queued. Callers materialise it
+        # later (post-step, fused into one sync). See base_experiment._step.
+        loss_no_reg = loss.detach()
+        if not self.model.training:
+            # single-dataset validation (base_experiment._validate) scores the plain per-event
+            # mean, as the multi-process _validate does: never the sign head's cross-entropy
+            # nor a training-side aggregation (tau), which made a signed pool's recorded
+            # validation (and its HPO objective) MSE + BCE, 6-10x the MSE
+            loss_no_reg = self._per_event_loss(y_pred, y, sigma=sigma).mean().detach()
+        loss        = loss + reg
+        if sync_blocking:
+            assert torch.isfinite(loss).all()   # original per-step guard (D2H sync)
+        return loss, loss_no_reg, mse_val
+
+    @staticmethod
+    def _accumulation_mode(value):
+        """training.per_process_accumulation -> None (off), "all_processes" or "round_robin".
+        false/null/off: the mixed batch. true/all_processes: one micro-batch from every process
+        per step, combined with the loss_aggregation weights (_per_process_step_grads).
+        round_robin: arXiv:2606.23791's batching (_round_robin_step_grads)."""
+        if value is None or value is False:
+            return None
+        if value is True:
+            return "all_processes"
+        v = str(value).strip().lower()
+        if v in ("false", "none", "null", "off", "0", ""):
+            return None
+        if v in ("true", "all_processes", "1"):
+            return "all_processes"
+        if v == "round_robin":
+            return "round_robin"
+        raise ValueError(f"training.per_process_accumulation: unknown mode {value!r} "
+                         "(false | all_processes | round_robin)")
+
+    def _split_microbatches(self, data):
+        """Cut one round-robin step (RoundRobinMicroBatchSampler) back into its single-process
+        micro-batches: contiguous runs of one process, each run cut at that process's
+        micro-batch size m_p (two consecutive slots of one process form one run of 2 m_p).
+        Pure CPU slicing, no device sync."""
+        particles, y, tokens, order_labels, ptr, process_ids = data
+        procs, counts = torch.unique_consecutive(process_ids, return_counts=True)
+        m = self._accum_sampler.m
+        bounds, e = [0], 0
+        for p, c in zip(procs.tolist(), counts.tolist()):
+            step = int(m[p])
+            for k in range(step, c + step, step):
+                bounds.append(e + min(k, c))
+            e += c
+        pt = ptr.tolist()
+        out = []
+        for e0, e1 in zip(bounds[:-1], bounds[1:]):
+            a0, a1 = pt[e0], pt[e1]
+            out.append((particles[a0:a1], y[e0:e1], tokens[a0:a1], order_labels[e0:e1],
+                        ptr[e0:e1 + 1] - a0, process_ids[e0:e1]))
+        return out
+
+    def _round_robin_step_grads(self, data):
+        """Gradient of one update under training.per_process_accumulation=round_robin, the
+        batching of arXiv:2606.23791 (Bahl, Plehn, Schiller, Sivagnanalingam), as their
+        trainer.py _step does it: G single-process micro-batches pulled per optimizer step,
+        each backpropagated as (its mean per-event loss) / G, one optimizer step on the sum.
+
+        Here each micro-batch's mean loss l_k is weighted by its event share n_k / N
+        (N = sum_k n_k): the accumulated gradient is that of the per-event MEAN over the
+        step's N = G*B events, which is their 1/G weighting whenever every micro-batch holds
+        B events (always, in their code: drop_last, and a process smaller than B is refused;
+        here such a process is capped at its pool size and its micro-batch counts by its events).
+        This is the faithful combination and the only one this mode uses: training.loss_aggregation
+        (geometric_mean, excess, tau) does not enter the gradient. With full micro-batches it
+        equals the arithmetic mean over the step's micro-batches of their process means, i.e.
+        loss_aggregation=mean restricted to the G processes the step holds.
+        Their loss is a per-token mean over a generative sequence; ours is the per-event loss
+        (_aggregate_per_process_loss on one process, sign-head term included), the same up to
+        what a 'unit' is. Regularization (and EWC) is backpropagated once, after the
+        micro-batches. Returns (loss, loss_no_reg, mse_val) detached, as _batch_loss.
+        """
+        micro = self._split_microbatches(data)
+        N = sum(len(mb[1]) for mb in micro)
+        self.optimizer.zero_grad()
+        agg, mse_sum = None, None
+        for mb in micro:
+            y_pred, y, pids, sigma, mse_val = self._forward_lloca(mb)
+            ell = self._aggregate_per_process_loss(y_pred, y, pids, "mean", sigma=sigma,
+                                                   sign=self._last_sign)
+            w = len(y) / N
+            (ell * w).backward()
+            agg = ell.detach() * w if agg is None else agg + ell.detach() * w
+            if mse_val is not None:
+                mse_sum = mse_val * w if mse_sum is None else mse_sum + mse_val * w
+
+        reg = self._reg_term(self.model)
+        if getattr(self, "ewc", None) is not None:
+            reg = reg + (self.cfg.fine_tune.ewc.get("lambda", 1000.0) / 2.0) * self.ewc.penalty(self.model)
+        if torch.is_tensor(reg) and reg.requires_grad:
+            reg.backward()
+        reg_val = reg.detach() if torch.is_tensor(reg) else reg
+        loss = agg + reg_val
+        if os.environ.get("LLOCA_SYNC", "deferred") == "blocking":
+            assert torch.isfinite(loss).all()
+        return loss, agg, mse_sum
+
+    @staticmethod
+    def _split_by_process(data):
+        """Cut a collated batch whose events are grouped by process (PerProcessMicroBatchSampler)
+        into one collated single-process micro-batch per process, in the batch's order.
+        Pure CPU slicing (ptr and process ids are born on the CPU), no device sync."""
+        particles, y, tokens, order_labels, ptr, process_ids = data
+        procs, counts = torch.unique_consecutive(process_ids, return_counts=True)
+        if len(torch.unique(procs)) != len(procs):
+            raise ValueError("per-process accumulation: the batch is not grouped by process")
+        ev = [0] + torch.cumsum(counts, 0).tolist()
+        pt = ptr.tolist()
+        out = []
+        for e0, e1 in zip(ev[:-1], ev[1:]):
+            a0, a1 = pt[e0], pt[e1]
+            out.append((particles[a0:a1], y[e0:e1], tokens[a0:a1], order_labels[e0:e1],
+                        ptr[e0:e1 + 1] - a0, process_ids[e0:e1]))
+        return out
+
+    def _per_process_step_grads(self, data):
+        """Gradient of one update under training.per_process_accumulation=all_processes (true):
+        one single-process micro-batch per process, accumulated into .grad. (Not
+        arXiv:2606.23791's scheme, which is the round_robin mode: _round_robin_step_grads,
+        dispatched from here.)
+
+        Leaves in .grad EXACTLY the gradient the mixed-batch loss has on the union of the
+        micro-batches, so the only difference between the modes is how a batch is composed.
+        With l_p the mean per-event loss of process p on its micro-batch, P the processes
+        present, and the mixed-batch training loss L = A(l_1..l_P) + lambda*R(theta):
+
+          grad L = sum_p (dA/dl_p) grad l_p + lambda grad R,
+
+        and each micro-batch's backward contributes one term of the sum:
+          * mean:            A = (1/P) sum_p l_p,  dA/dl_p = 1/P. Backward l_p / P; done.
+          * geometric_mean:  A = exp(G), G = (1/P) sum_p log(l_p + tau), so
+                             dA/dl_p = A / (P (l_p + tau)): the weight depends on every l_q,
+                             known only after the last micro-batch. But grad A = A grad G and
+                             grad G = sum_p grad log(l_p + tau) / P has purely local terms:
+                             backward log(l_p + tau) / P per micro-batch, then multiply the
+                             accumulated gradient by the scalar A. Exact in one pass, no second
+                             forward and no graph kept alive across micro-batches.
+          * excess:          A = (1/P) sum_p c_p w_p l_p / wbar, c_p = (1/ref_p)/mean(1/ref),
+                             w_p = (l_p/ref_p)^beta detached, wbar its mean over the present
+                             processes (1 when beta = 0): backward c_p w_p l_p / P, divide by wbar.
+          (HETEROSC forces mean, as in _aggregate_per_process_loss.)
+        The update is therefore the per-process gradients combined with the aggregation's
+        weights, i.e. the MEAN over processes for loss_aggregation=mean (not the sum): a sum
+        would scale the step by P against the mixed batch and change the meaning of lr,
+        clip_grad_norm and lambda between the two modes.
+        Regularization (and the EWC penalty) is backpropagated once, after the micro-batches,
+        never P times. Returns (loss, loss_no_reg, mse_val) as detached tensors, the same
+        quantities _batch_loss returns, for the logging and the NaN guard in _step.
+        """
+        if getattr(self, "_accum_mode", "all_processes") == "round_robin":
+            return self._round_robin_step_grads(data)
+        micro = self._split_by_process(data)
+        P = len(micro)
+        loss_agg = self.cfg.training.get("loss_aggregation", "mean")
+        if self.cfg.training.loss == "HETEROSC":
+            loss_agg = "mean"
+        tau = float(self.cfg.training.get("loss_aggregation_tau", 0.0) or 0.0)
+        beta = float(self.cfg.training.get("excess_beta", 0.0) or 0.0)
+        if loss_agg not in ("mean", "geometric_mean", "excess"):
+            raise ValueError(f"per-process accumulation: unknown loss_aggregation {loss_agg}")
+        if loss_agg == "excess":
+            ref = self._excess_reference()
+            inv = 1.0 / ref
+            c = inv / inv.mean()                       # over all datasets, as the mixed path
+
+        self.optimizer.zero_grad()
+        ells, ws, mse_sum, n_ev = [], [], None, 0
+        for mb in micro:
+            y_pred, y, pids, sigma, mse_val = self._forward_lloca(mb)
+            # one process present: the "mean" aggregation is exactly that process's mean loss
+            # (the same segment mean, sign-head term included, as in the mixed batch)
+            ell = self._aggregate_per_process_loss(y_pred, y, pids, "mean", sigma=sigma,
+                                                   sign=self._last_sign)
+            if loss_agg == "mean":
+                term = ell / P
+            elif loss_agg == "geometric_mean":
+                term = (ell + tau).clamp(min=1e-30).log() / P
+            else:
+                p = int(mb[5][0])
+                w = ((ell.detach() / ref[p].to(ell)).clamp(min=1e-12) ** beta) if beta > 0 else None
+                term = c[p].to(ell) * ell / P * (w if w is not None else 1.0)
+                if w is not None:
+                    ws.append(w)
+            term.backward()
+            ells.append(ell.detach())
+            if mse_val is not None:
+                k = len(y)
+                mse_sum = mse_val * k if mse_sum is None else mse_sum + mse_val * k
+                n_ev += k
+
+        ell_t = torch.stack(ells)
+        grads = [q.grad for q in self.model.parameters() if q.grad is not None]
+        if loss_agg == "geometric_mean":
+            agg = ((ell_t + tau).clamp(min=1e-30).log().sum() / P).exp()
+            for g in grads:
+                g.mul_(agg)
+        elif loss_agg == "excess":
+            pids_all = torch.as_tensor([int(mb[5][0]) for mb in micro])
+            e = ell_t * c[pids_all].to(ell_t)
+            if ws:
+                wbar = torch.stack(ws).mean()
+                for g in grads:
+                    g.div_(wbar)
+                e = e * torch.stack(ws) / wbar
+            agg = e.sum() / P
+        else:
+            agg = ell_t.sum() / P
+
+        reg = self._reg_term(self.model)
+        if getattr(self, "ewc", None) is not None:
+            reg = reg + (self.cfg.fine_tune.ewc.get("lambda", 1000.0) / 2.0) * self.ewc.penalty(self.model)
+        if torch.is_tensor(reg) and reg.requires_grad:
+            reg.backward()
+        reg_val = reg.detach() if torch.is_tensor(reg) else reg
+        loss = agg + reg_val
+        mse_val = (mse_sum / n_ev) if mse_sum is not None else None
+        if os.environ.get("LLOCA_SYNC", "deferred") == "blocking":
+            assert torch.isfinite(loss).all()
+        return loss, agg, mse_val
+
+    def _per_event_loss(self, y_pred, y, sigma=None):
+        """Per-event loss vector (B,) with NO cross-event reduction.
+
+        Mirrors the elementwise term of each loss in `_init_loss`, then means over
+        the feature dim only — so the result can be segment-averaged per process.
+        Because every supported loss is a mean over an elementwise term, this works
+        for any of them (MSE / L1 / LogCosh / RelL1 / HETEROSC); wiring het loss into
+        the LLoCa path later needs no change here (just split `sigma` out of `y_pred`
+        upstream and pass it in).
+
+        Arg order matches the existing `self.loss(y_pred, y)` call in the loop, so
+        results stay numerically identical to the previous per-process loop —
+        including RelL1's quirk of using the *prediction* in the denominator.
+        """
+        name = self.cfg.training.loss
+        if name == "MSE":
+            elem = (y_pred - y) ** 2
+        elif name == "L1":
+            elem = (y_pred - y).abs()
+        elif name == "LogCosh":
+            d = y_pred - y
+            elem = d + torch.nn.functional.softplus(-2.0 * d) - math.log(2.0)
+        elif name == "RelL1":
+            eps = torch.tensor(1e-8, device=y.device, dtype=y.dtype)
+            # denominator uses y_pred to match self.loss(y_pred, y) call order
+            elem = ((y_pred - y) / torch.maximum(y_pred.abs(), eps)).abs()
+        elif name == "HETEROSC":
+            assert sigma is not None, "HETEROSC per-event loss requires sigma"
+            # DIAGNOSTIC (heterosc_mu_only): keep the 2-ch HETEROSC net exactly as-is but
+            # optimise plain MSE on mu, so sigma receives no gradient at all. Bisects a
+            # "the objective is wrong" cause from a "the 2-ch model/wiring is wrong" cause:
+            # the beta=1 mu-gradient is provably 0.5x the MSE one (uniform, Adam-invariant),
+            # so this arm MUST reproduce the 1-ch MSE result unless the model is at fault.
+            if bool(self.cfg.training.get("heterosc_mu_only", False)):
+                elem = (y_pred - y) ** 2
+                return self._is_weighted(elem.flatten(1).mean(dim=1), y) \
+                    if self.cfg.training.get("is_weight_path", None) else elem.flatten(1).mean(dim=1)
+            # STAGE 2 of the two-stage recipe (heterosc_sigma_only): mu comes from a frozen,
+            # MSE-trained trunk+head, and only the sigma readout row trains. Detaching mu here
+            # makes the residual a CONSTANT w.r.t. autograd, so the NLL's mu-gradient
+            # ((mu-y)/sigma^2) cannot touch the frozen weights even numerically, and sigma is
+            # fitted against a fixed error field. With mu fixed there is no (mu,sigma)
+            # multi-task coupling and, at beta=0, the Gaussian NLL is a PROPER scoring rule for
+            # sigma (its only stationary point is sigma=|r|; the beta>0 spurious optimum at
+            # r*=exp(-1/2-1/(2*beta)) is a statement about mu, which is no longer free).
+            if bool(self.cfg.training.get("heterosc_sigma_only", False)):
+                y_pred = y_pred.detach()
+            sigma_c = torch.clamp(sigma, min=1e-15, max=1e5)
+            elem = ((y - y_pred) ** 2) / (2 * sigma_c ** 2) + torch.log(sigma_c)
+            # β-NLL (Seitzer 2022): scale each event's NLL by a DETACHED σ^{2β}. β=0 is
+            # plain NLL; β>0 cancels the 1/σ² that starves μ's gradient where σ is large.
+            beta = float(self.cfg.training.get("heterosc_beta", 0.0) or 0.0)
+            if beta > 0.0:
+                elem = (sigma_c.detach() ** (2.0 * beta)) * elem
+        else:
+            raise ValueError(f"Unknown loss function {name}")
+        # mean over feature dims → (B,)
+        per_event = elem.flatten(1).mean(dim=1) if elem.dim() > 1 else elem
+        return self._is_weighted(per_event, y) if self.cfg.training.get("is_weight_path", None) else per_event
+
+    def _is_weighted(self, per_event, y):
+        """Importance-sampling correction of the TRAINING loss (training.is_weight_path; off when null).
+
+        A pool drawn from a density pi that oversamples some log|M|^2 regions (sigma-emphasized generation) trains
+        the objective Q it was drawn against when each event's loss is multiplied by c_b = Q_b / pi_b of its
+        log|M|^2 bin: with sum_b pi_b c_b = 1 the batch loss is an unbiased estimator of the Q-weighted objective
+        for any pi, so the emphasis changes only the gradient variance. The table {logm_edges, c} is written at
+        pool build (analysis/divergences/l2_online.py build_pool). Validation is never weighted: the recorded
+        val_loss_no_reg stays the plain per-event mean of the pool."""
+        if not self.model.training:
+            return per_event
+        isw = self._get_is_weights()
+        if isw is None:
+            return per_event
+        edges, cvals, amp_mean, amp_std = isw
+        yf = (y.flatten(1).mean(dim=1) if y.dim() > 1 else y).detach()
+        logm = yf * amp_std + amp_mean                     # standardized log-amp -> raw log|M|^2
+        b = torch.bucketize(logm.to(edges.dtype), edges).clamp(0, cvals.numel() - 1)
+        return per_event * cvals[b].to(per_event.dtype)
+
+    def _get_is_weights(self):
+        """The per-log|M|^2-bin IS table of training.is_weight_path, loaded once; None when the path is null."""
+        if getattr(self, "_is_weight_cache", "unset") != "unset":
+            return self._is_weight_cache
+        path = self.cfg.training.get("is_weight_path", None)
+        if not path:
+            self._is_weight_cache = None
+            return None
+        with open(path) as f:
+            d = json.load(f)
+        edges = torch.tensor(d["logm_edges"][1:-1], device=self.device, dtype=torch.float64)   # inner edges
+        cvals = torch.tensor(d["c"], device=self.device, dtype=torch.float64)
+        if np.atleast_1d(self.prepd_mean).size != 1:   # one table over one pool's log|M|^2 axis
+            raise ValueError("training.is_weight_path needs a single-process run (one amplitude preprocessing)")
+        amp_mean = float(np.atleast_1d(self.prepd_mean)[0])
+        amp_std = float(np.atleast_1d(self.prepd_std)[0])
+        LOGGER.info(f"IS correction from {path}: {cvals.numel()} log|M|^2 bins, c in "
+                    f"[{float(cvals.min()):.3f}, {float(cvals.max()):.3f}]")
+        self._is_weight_cache = (edges, cvals, amp_mean, amp_std)
+        return self._is_weight_cache
+
+    def _noise_chunk_losses(self, data, k, mse_out=None):
+        """base_experiment._noise_measure: the step's batch cut into k runs of consecutive events (the shuffled
+        sampler's order, so random subsets), each chunk's loss the batch's own aggregation restricted to its events:
+        per-process weights 1/(P n_p) counted on the whole batch, times k, plus the regularisation term, so the k
+        chunk gradients average to the batch gradient. Yields the losses one at a time (one graph alive); a list
+        mse_out gets each chunk's (mu-MSE or None, events), for the batch_accumulation path's train mu-MSE curve."""
+        if self.modelname not in ("LLOCATransformer", "LLOCAMuPTransformer", "MuPLGATr", "MuPLGATrSlim"):
+            raise NotImplementedError(f"find_BS: chunked noise measurement not wired for {self.modelname}")
+        agg = "mean" if self.cfg.training.loss == "HETEROSC" else self.cfg.training.get("loss_aggregation", "mean")
+        if (agg != "mean" or getattr(self, "_per_process_accum", False) or self.ewc is not None
+                or os.environ.get("LLOCA_PROC_LOSS", "vectorized") == "loop"):
+            raise NotImplementedError("find_BS: the chunk losses need the mean aggregation on the mixed batch "
+                                      "(no geometric mean, per-process accumulation, EWC or LLOCA_PROC_LOSS=loop)")
+        particles, y, tokens, order_labels, ptr, process_ids = data
+        n = int(y.shape[0])
+        counts = torch.bincount(process_ids.reshape(-1), minlength=self.n_datasets).to(self.device)
+        pt = ptr.tolist()
+        cuts = [round(i * n / k) for i in range(k + 1)]
+        for e0, e1 in zip(cuts[:-1], cuts[1:]):
+            a0, a1 = pt[e0], pt[e1]
+            chunk = (particles[a0:a1], y[e0:e1], tokens[a0:a1], order_labels[e0:e1], ptr[e0:e1 + 1] - a0,
+                     process_ids[e0:e1])
+            y_pred, yc, pids, sigma, mse_c = self._forward_lloca(chunk)
+            if mse_out is not None:
+                mse_out.append((mse_c, e1 - e0))
+            loss = self._aggregate_per_process_loss(y_pred, yc, pids, "mean", sigma=sigma, sign=self._last_sign,
+                                                    full_counts=counts)
+            yield k * loss + self._reg_term(self.model)   # k exactly: the chunks then average to the batch loss
+
+    def _aggregate_per_process_loss(self, y_pred, y, process_ids, loss_agg, sigma=None, sign=None, full_counts=None):
+        """Mean (or geometric mean) over per-process mean losses.
+
+        Vectorised replacement for the old
+            for p in torch.unique(process_ids): self.loss(y_pred[mask], y[mask])
+        loop, which launched ~3 kernels per process every step and forced a
+        torch.unique sync. Here we compute a per-event loss once, then segment-mean
+        it by process with a single index_add_ into a fixed-size buffer
+        (size = self.n_datasets, since process_ids are contiguous 0..n_datasets-1),
+        so there is no Python loop and no GPU→CPU sync.
+
+        Set LLOCA_PROC_LOSS=loop to fall back to the original loop (A/B checks).
+        """
+        # τ-floored geometric mean (training.loss_aggregation_tau, default 0 = off):
+        # aggregate log(MSE_p + τ) instead of log(MSE_p), capping a converged
+        # process's gradient weight at 1/τ while leaving processes above τ on the
+        # exact geometric-mean behaviour. TRAINING loss only — validation and
+        # checkpoint selection stay on the unfloored metric, so comparisons with
+        # existing runs are unchanged (see sec:bigrun open threads).
+        tau = float(self.cfg.training.get("loss_aggregation_tau", 0.0) or 0.0)
+        if not getattr(getattr(self, "model", None), "training", False):
+            tau = 0.0
+        # geometric_mean takes log(per-process loss), valid only for NON-NEGATIVE losses
+        # (MSE/L1/…). The HETEROSC NLL is SIGNED (the log σ term), so log()+clamp destroys
+        # the gradient of every well-fit (negative-NLL) process → μ collapses to the mean.
+        # Force arithmetic mean for HETEROSC.
+        if self.cfg.training.loss == "HETEROSC":
+            loss_agg = "mean"
+        if os.environ.get("LLOCA_PROC_LOSS", "vectorized") == "loop" and loss_agg != "excess":
+            if self.cfg.training.get("is_weight_path", None):
+                raise NotImplementedError("LLOCA_PROC_LOSS=loop does not carry training.is_weight_path")
+            unique_procs = torch.unique(process_ids)
+            per_proc = [self.loss(y_pred[process_ids == p], y[process_ids == p])
+                        for p in unique_procs]
+            if loss_agg == "geometric_mean" and len(per_proc) > 1:
+                return (torch.stack(per_proc) + tau).log().mean().exp()
+            return torch.stack(per_proc).mean()
+
+        per_event = self._per_event_loss(y_pred, y, sigma=sigma)        # (B,)
+        if sign is not None:
+            # training.sign_head: per-event binary cross-entropy on the sign logit, on the
+            # sign-changing pools only (training loss; the validation metric stays the MSE)
+            logit, target = sign
+            bce = torch.nn.functional.binary_cross_entropy_with_logits(
+                logit.reshape(-1), target.reshape(-1), reduction="none")
+            w = float(self.cfg.training.get("sign_loss_weight", 1.0))
+            if not hasattr(self, "_proc_signed_t"):
+                self._proc_signed_t = torch.as_tensor(self._proc_signed, device=per_event.device)
+            if getattr(self, "_sign_near_thr", None) is not None and self.model.training:
+                # training.sign_near_weight: weight toward the events near the zero crossing (see init_data)
+                if not hasattr(self, "_sign_near_thr_t"):
+                    self._sign_near_thr_t = torch.as_tensor(self._sign_near_thr, device=per_event.device)
+                    self._sign_near_norm_t = torch.as_tensor(self._sign_near_norm, device=per_event.device)
+                wn = float(self.cfg.training.get("sign_near_weight", 1.0))
+                near = (y.reshape(y.shape[0], -1)[:, 0] <= self._sign_near_thr_t[process_ids]).to(bce.dtype)
+                bce = bce * (1.0 + (wn - 1.0) * near) * self._sign_near_norm_t.to(bce.dtype)[process_ids]
+            if sigma is not None and bool(self.cfg.training.get("sign_het_match", False)):
+                # training.sign_het_match (HETEROSC): each event's sign cross-entropy times the factor the het NLL puts
+                # on that event's mu gradient over the MSE's, sigma^(2 beta) / (2 sigma^2) (d/dmu of r^2/(2 sigma^2) is
+                # that factor times d/dmu of r^2), detached: the sign:magnitude gradient ratio of every event is then
+                # the MSE control's, which under the plain weight the het loss shrinks by about the ratio of the two
+                # losses' gradient norms (plan catalog_coverage step 61)
+                beta = float(self.cfg.training.get("heterosc_beta", 0.0) or 0.0)
+                sc = torch.clamp(sigma.detach(), min=1e-15, max=1e5)
+                fac = (sc ** (2.0 * beta) / (2.0 * sc ** 2)).flatten(1).mean(dim=1)
+                bce = bce * fac.to(bce.dtype)
+            per_event = per_event + w * bce * self._proc_signed_t.to(per_event.dtype)[process_ids]
+        n_proc = self.n_datasets
+        sums   = per_event.new_zeros(n_proc)
+        counts = per_event.new_zeros(n_proc)
+        sums.index_add_(0, process_ids, per_event)
+        counts.index_add_(0, process_ids, torch.ones_like(per_event))
+        if full_counts is not None:   # _noise_chunk_losses: a chunk's events at the whole batch's per-process weights
+            assert loss_agg == "mean", "full_counts is defined for the mean aggregation only"
+            counts = full_counts.to(per_event.dtype)
+        present   = counts > 0
+        n_present = present.sum().clamp(min=1)
+        proc_mean = sums / counts.clamp(min=1)                         # 0 where a process is absent
+        if loss_agg == "geometric_mean":
+            # mean over present processes of log(proc_mean + τ), then exp; absent → 0 (dropped)
+            log_pm = torch.where(present, (proc_mean + tau).clamp(min=1e-30).log(),
+                                 torch.zeros_like(proc_mean))
+            return (log_pm.sum() / n_present).exp()
+        if loss_agg == "excess":
+            # Excess-loss aggregation (training.excess_reference, excess_beta): each process
+            # is scored by its ratio e_p = m_p / L_ref(n_p) to a per-multiplicity reference,
+            # the loss a process of that multiplicity reaches ALONE on the compute this run
+            # gives every process (T steps at bs/P; same multiplicity, same scaling), and the
+            # loss is mean_p e_p^beta (detached) * e_p. The gradient weight of a process is
+            # set by the reference, not by its own current loss: no 1/m_p veto of the converged
+            # bulk (geometric mean), no domination by the largest raw MSE (arithmetic mean);
+            # beta > 0 adds DoReMi-style emphasis on the processes furthest above their reference.
+            # The reference weights 1/L_ref are normalised to mean one over the processes,
+            # so the loss has the arithmetic mean's scale (~1 at initialisation) and differs
+            # from it only in direction: unnormalised, the loss sat ~250x higher, the
+            # gradient was clipped on every step (median pre-clip norm 131 against 0.65)
+            # and the outputs blew up within the first 50 steps.
+            ref = self._excess_reference().to(proc_mean)
+            inv = 1.0 / ref
+            e = proc_mean * (inv / inv.mean())
+            beta = float(self.cfg.training.get("excess_beta", 0.0) or 0.0)
+            if beta > 0:
+                w = (proc_mean.detach() / ref).clamp(min=1e-12) ** beta
+                e = e * (w / w[present].mean().clamp(min=1e-12))
+            e = torch.where(present, e, torch.zeros_like(e))
+            return e.sum() / n_present
+        return proc_mean.sum() / n_present
+
+    def _excess_reference(self):
+        """Per-process reference loss L_ref(n_p) for the excess aggregation.
+
+        training.excess_reference maps the particle count of an event (initial + final,
+        string or int key) to one number: the validation loss a process of that
+        multiplicity reaches alone on this run's per-process compute (a solo run at
+        bs/P for the same steps). A missing multiplicity falls back to the nearest one
+        present. Built once."""
+        cache = getattr(self, "_excess_ref_cache", None)
+        if cache is not None:
+            return cache
+        ref_cfg = self.cfg.training.get("excess_reference", None)
+        if not ref_cfg:
+            raise ValueError("loss_aggregation=excess needs training.excess_reference "
+                             "({n_particles: solo loss at this run's compute} per multiplicity)")
+        table = {int(k): float(v) for k, v in dict(ref_cfg).items()}
+        keys = np.array(sorted(table))
+        out = np.empty(self.n_datasets, dtype=np.float64)
+        if not np.any(np.asarray(self._proc_npart) > 0):
+            raise ValueError("excess reference: the per-process particle counts are unfilled, "
+                             "every process would take the smallest multiplicity's reference")
+        snapped = []
+        for p in range(self.n_datasets):
+            n = int(self._proc_npart[p]) if self._proc_npart[p] > 0 else int(keys[0])
+            k = int(keys[np.argmin(np.abs(keys - n))])
+            if k != n:
+                snapped.append((self.cfg.data.dataset[p], n, k))
+            out[p] = table[k]
+        if snapped:
+            LOGGER.warning(f"excess reference: {len(snapped)} processes have no reference at their "
+                           f"multiplicity and take the nearest one, e.g. {snapped[:3]}")
+        self._excess_ref_cache = torch.as_tensor(np.maximum(out, 1e-8), dtype=torch.float32)
+        return self._excess_ref_cache
+
+
+    def _init_metrics(self):
+        result_key = (
+            "combined" if len(self.cfg.data.dataset) > 1 else self.cfg.data.dataset[0]
+        )
+        return {f"{result_key}.mse": []}
+
+    @staticmethod
+    def _robust_slope(log_c, log_l):
+        """Theil–Sen slope: median of pairwise slopes.  Far less sensitive than
+        least-squares to the noise in short (compute, loss) windows — a single
+        outlier validation can't swing the estimated exponent.  Returns None when
+        no pair has a usable compute separation.
+        """
+        m = len(log_c)
+        slopes = []
+        for i in range(m):
+            for j in range(i + 1, m):
+                dc = log_c[j] - log_c[i]
+                if abs(dc) > 1e-9:
+                    slopes.append((log_l[j] - log_l[i]) / dc)
+        if not slopes:
+            return None
+        return float(np.median(slopes))
+
+    def _alpha_and_se(self, ds_name: str, proc_idx: int, start_idx=None,
+                      target_span: float = 0.4, max_lookback: int = 30,
+                      min_obs: int = 4, min_span: float = 0.1):
+        """Local exponent α and its standard error over a (compute, EMA-loss) window.
+
+        α = −slope of log(L) vs log(compute) via Theil–Sen (robust).  SE(α) is the
+        OLS-style slope standard error using a robust residual scale (MAD).  A narrow
+        or noisy window → large SE, so the significance tests in the controller
+        default to "keep feeding" whenever the data can't support a confident call.
+
+        Window selection is **span-targeted, not count-based**: compute accrues
+        roughly linearly, so a fixed number of recent validations shrinks in
+        log-compute over training and eventually falls below `min_span`, blinding the
+        controller (everything looks undecidable → uniform).  Instead the recent
+        window walks back until it spans `target_span` in log-compute (≥ min_obs
+        points, ≤ max_lookback validations).  When start_idx is given (a probe), the
+        window is exactly [start_idx:], growing as the probe continues.
+
+        Returns (alpha, se, n_points); se = inf when the window can't be judged
+        (< min_obs points, or log-compute span below `min_span`).  The span guard is
+        essential — on a 2–3 point window the MAD residual scale collapses to ≈0 and
+        SE looks deceptively tiny, which would let status flip on pure noise.
+        """
+        snapshots   = self.train_sampler.compute_snapshots
+        losses_hist = getattr(self, "_proc_ema_losses", {}).get(ds_name, [])
+        end = min(len(losses_hist), len(snapshots))
+
+        def _pt(k):
+            c = snapshots[k].get(proc_idx, 0)
+            l = losses_hist[k]
+            return (np.log(c), np.log(l)) if (c > 0 and l > 0) else None
+
+        pts = []
+        if start_idx is not None:                    # probe window: exactly [start:end)
+            for k in range(max(0, start_idx), end):
+                p = _pt(k)
+                if p:
+                    pts.append(p)
+        else:                                        # recent: span-targeted lookback
+            for k in range(end - 1, max(-1, end - max_lookback) - 1, -1):
+                p = _pt(k)
+                if p:
+                    pts.append(p)
+                    if len(pts) >= min_obs and (pts[0][0] - pts[-1][0]) >= target_span:
+                        break
+        if len(pts) < min_obs:
+            return 0.0, np.inf, len(pts)
+        log_c = np.array([p[0] for p in pts])
+        log_l = np.array([p[1] for p in pts])
+        sd_c = float(log_c.std())
+        if sd_c < 1e-6 or float(log_c.max() - log_c.min()) < min_span:
+            return 0.0, np.inf, len(pts)            # too little compute spread to judge
+        slope = self._robust_slope(log_c, log_l)
+        if slope is None:
+            return 0.0, np.inf, len(pts)
+        intercept = float(np.median(log_l - slope * log_c))
+        resid = log_l - (intercept + slope * log_c)
+        sigma = 1.4826 * float(np.median(np.abs(resid - np.median(resid))))
+        if sigma <= 0:
+            sigma = float(resid.std())            # MAD degenerate → plain std
+        se = sigma / (sd_c * np.sqrt(len(pts)))
+        return float(-slope), float(se), len(pts)
+
+    def _compute_sampler_weights(self, dataset_names):
+        """Significance-based plateau detection + status-aware weighting.
+
+        For each dataset the controller fits the local exponent α and its standard
+        error SE(α) over recent (compute, EMA-loss) history.  A dataset is only
+        *confirmed plateaued* — and thus allowed to fall below uniform — when, even
+        optimistically (α + k·SE), its improvement rate is below a meaningful floor
+        α_min; it is sent to a *probe* (boosted sampling, which shrinks SE) before
+        that call is trusted, and re-probed periodically in case it is a late
+        bloomer.  When the data is too noisy/narrow to decide (large SE), the test
+        fails safe to "keep feeding", which is what breaks the self-reinforcing
+        starvation of a transient low slope.
+
+        The single significance knob k (sampler_sig_k) and the meaning-of-flat knob
+        α_min (sampler_alpha_min) replace the old hand-thresholds (plateau_rel,
+        plateau_alpha, dwell, alpha_smooth, probe_len, probe_min_growth,
+        recover_min_drop): the noise handling is now adaptive per dataset.
+
+        Returns (weights, statuses, alphas) where alphas are the clipped α used for
+        weighting (handy for logging).
+        """
+        cfg        = self.cfg.training
+        warmup     = cfg.get("sampler_warmup_vals", 10)
+        reprobe    = cfg.get("sampler_reprobe_every", 20)
+        probe_boost = cfg.get("sampler_probe_boost", 1.0)
+        min_frac   = cfg.get("sampler_min_alpha_frac", 0.25)
+        alpha_min  = cfg.get("sampler_alpha_min", 0.05)
+        sig_k      = cfg.get("sampler_sig_k", 2.0)
+        probe_max  = cfg.get("sampler_probe_max", 15)
+        max_lookback = cfg.get("sampler_alpha_window", 30)
+        gamma      = cfg.get("sampler_deficit_gamma", 1.5)
+        dcap       = cfg.get("sampler_deficit_cap", 2.0)
+        plat_floor = cfg.get("sampler_plateau_floor", 0.3)
+
+        # debounce: consecutive low-α readings required before opening a probe, so a
+        # single borderline/knee reading can't start (or re-start) one.  Structural,
+        # not a sensitivity knob.
+        TRIGGER_DEBOUNCE = 2
+
+        if not hasattr(self, "_ds_status"):
+            self._ds_status      = {n: "scaling" for n in dataset_names}
+            self._probe_start    = {n: None for n in dataset_names}
+            self._last_probe_val = {n: 0 for n in dataset_names}
+            self._low_streak     = {n: 0 for n in dataset_names}
+            self._ds_status_hist = {n: [] for n in dataset_names}
+            # per-dataset *expected solo* exponent α_solo (real, from solo runs).
+            # A dataset whose live local α sits below α_solo is under-scaling →
+            # boosted.  Falls back to {} (no boost) if the reference is absent.
+            self._solo_alpha = {}
+            p = cfg.get("sampler_solo_alpha_path", None)
+            if not p:
+                dcfg = self.cfg.get("data", None)
+                dp = (dcfg.get("data_path", "") if dcfg else "") or ""
+                p = os.path.join(dp, "solo_alpha.json") if dp else None
+            try:
+                if p and os.path.exists(p):
+                    self._solo_alpha = json.load(open(p))
+                    LOGGER.info(f"Sampler loaded solo-α reference ({len(self._solo_alpha)} ds): {p}")
+                else:
+                    LOGGER.warning(f"Sampler solo-α reference not found at {p}; deficit boosting disabled")
+            except Exception as e:
+                LOGGER.warning(f"Sampler solo-α load failed ({p}): {e}")
+
+        # current 0-based validation index (histories appended once per validation)
+        hist_lens = [len(self._proc_ema_losses[m])
+                     for m in dataset_names if m in self._proc_ema_losses]
+        n = (max(hist_lens) - 1) if hist_lens else 0
+
+        # recent-window (α, SE) per dataset — drives both trigger and weighting
+        ase = {name: self._alpha_and_se(name, i, max_lookback=max_lookback)
+               for i, name in enumerate(dataset_names)}
+        # clipped α (positive, bounded) used only for the proportional weighting
+        alpha_w = {name: float(np.clip(ase[name][0], 0.05, 2.0)) for name in dataset_names}
+
+        # warmup: uniform sampling so every dataset can enter its scaling regime
+        # before any down-weighting decision is made.
+        if n < warmup:
+            for name in dataset_names:
+                self._ds_status_hist[name].append(self._ds_status[name])
+            return [1.0] * len(dataset_names), dict(self._ds_status), alpha_w
+
+        # ── status state machine (significance-gated) ─────────────────────────
+        for i, name in enumerate(dataset_names):
+            a, se, _ = ase[name]
+            s = self._ds_status[name]
+            if s == "scaling":
+                # trigger a probe only after the point estimate has sat below the
+                # meaningful floor for TRIGGER_DEBOUNCE consecutive validations
+                if np.isfinite(se) and a < alpha_min:
+                    self._low_streak[name] += 1
+                else:
+                    self._low_streak[name] = 0
+                if self._low_streak[name] >= TRIGGER_DEBOUNCE:
+                    s = "probing"
+                    self._probe_start[name] = n
+                    self._low_streak[name] = 0
+            elif s == "probing":
+                # judge on the probe window (boosted sampling has shrunk its SE)
+                pa, pse, _ = self._alpha_and_se(name, i, start_idx=self._probe_start[name])
+                elapsed = n - self._probe_start[name]
+                # plateau requires the loss to be confidently FLAT — below the floor
+                # AND not rising (pa > -alpha_min).  A rising loss (pa << 0) is a
+                # disruption/spike, not a plateau, and must keep being fed.
+                if np.isfinite(pse) and pa - sig_k * pse > alpha_min:
+                    s = "scaling"                 # significantly still improving
+                elif np.isfinite(pse) and pa + sig_k * pse < alpha_min and pa > -alpha_min:
+                    s = "plateaued"               # significantly flat, not rising
+                    self._last_probe_val[name] = n
+                elif elapsed >= probe_max:        # undecided too long → fail safe
+                    if np.isfinite(pse) and pa < alpha_min and pa > -alpha_min:
+                        s = "plateaued"
+                        self._last_probe_val[name] = n
+                    else:
+                        s = "scaling"
+            elif s == "plateaued":
+                if n - self._last_probe_val[name] >= reprobe:
+                    s = "probing"                 # periodic re-probe for late bloomers
+                    self._probe_start[name] = n
+            self._ds_status[name] = s
+
+        # ── deficit-based weights: boost datasets scaling BELOW their solo α ──
+        # deficit_d = max(0, α_solo_d − α_local_d): how far a dataset is under its
+        # expected solo scaling (i.e. starved by the mixture).  At-or-above-solo
+        # datasets stay at baseline (they don't need extra compute); confirmed-
+        # plateaued ones drop to plat_floor.  This replaces the old weight∝α rule,
+        # which boosted the *fast* (easy, already-above-solo) datasets — exactly the
+        # ones that need help least.
+        deficits = {}
+        weights = []
+        for name in dataset_names:
+            a_local, se, _ = ase[name]
+            s = self._ds_status[name]
+            sa = self._solo_alpha.get(name)
+            if sa is not None and np.isfinite(se):
+                deficits[name] = float(np.clip(sa - a_local, 0.0, dcap))
+            else:
+                deficits[name] = 0.0
+            if s == "plateaued":
+                w = plat_floor                       # truly done → save compute
+            else:
+                w = 1.0 + gamma * deficits[name]     # baseline 1.0, boosted if under solo
+            weights.append(w)
+
+        for name in dataset_names:
+            self._ds_status_hist[name].append(self._ds_status[name])
+
+        # expose deficits for logging
+        self._last_deficits = deficits
+        return weights, dict(self._ds_status), alpha_w
+
+    def _validate(self, step):
+        """Override base _validate.
+
+        Single dataset: delegates to base (no change).
+        Multiple datasets: runs per-process val loaders only.
+        Combined loss is the geometric mean of per-process losses (scale-invariant,
+        treats relative improvements equally across processes of different difficulty).
+        Sampler weights are updated by estimated local power-law exponent α_eff per
+        process — giving more batch slots to processes that are still improving and
+        fewer to those that have plateaued.
+        """
+        if not self.proc_val_loaders:
+            return super()._validate(step)
+
+        # Snapshot compute counts at the start of this validation (before any updates)
+        if self.train_sampler is not None:
+            self.train_sampler.record_snapshot()
+
+        self.model.eval()
+        if self.cfg.training.optimizer == "ScheduleFree":
+            self.optimizer.eval()
+
+        proc_losses        = {}
+        proc_losses_no_reg = {}
+        proc_mse_vals      = {}
+
+        is_lloca = self.modelname in ("LLOCATransformer", "LLOCAMuPTransformer", "MuPLGATr", "MuPLGATrSlim")
+        val_mode = os.environ.get("LLOCA_VAL", "combined")   # combined | loop | check (both, log the deviation)
+        if is_lloca and val_mode != "loop":
+            # One pass over the COMBINED val loader (evaluation.batchsize events per batch)
+            # with the per-process means accumulated by index_add_, as the training loss
+            # does. The per-process loaders capped their batch at half a process's val
+            # pool (1000 events for the catalog's 2000), so a validation was ~2 forward
+            # passes per process plus a sync each: 956 batches and 32 s for 478 processes,
+            # against 58 batches here; twenty validations were 11 of a 1000-step run's 30
+            # minutes. The per-process mean over all of a process's events is what the
+            # loop computed too (equal-size batches, drop_last on a pool of 2000 drops
+            # nothing), so the numbers are the same up to summation order. LLOCA_VAL=loop
+            # keeps the loop for A/B checks. The loss with reg is the no-reg loss plus the
+            # whole-model reg term, as in the loop (reg does not depend on the batch).
+            n_proc = self.n_datasets
+            sums   = torch.zeros(n_proc, device=self.device, dtype=torch.float64)
+            counts = torch.zeros(n_proc, device=self.device, dtype=torch.float64)
+            mse_sums = torch.zeros(n_proc, device=self.device, dtype=torch.float64)
+            sign_ok = torch.zeros(n_proc, device=self.device, dtype=torch.float64)
+            bce_sums = torch.zeros(n_proc, device=self.device, dtype=torch.float64)
+            ema_ctx = self.ema.average_parameters() if self.ema is not None else contextlib.nullcontext()
+            with torch.no_grad(), ema_ctx:
+                for data in self.val_loader:
+                    y_pred, y, pids, sigma, _ = self._forward_lloca(data)
+                    per_event = self._per_event_loss(y_pred, y, sigma=sigma).to(torch.float64)
+                    sums.index_add_(0, pids, per_event)
+                    counts.index_add_(0, pids, torch.ones_like(per_event))
+                    if getattr(self, "_last_sign", None) is not None:
+                        logit, target = self._last_sign
+                        ok = ((logit.reshape(-1) > 0) == (target.reshape(-1) > 0.5)).to(torch.float64)
+                        sign_ok.index_add_(0, pids, ok)
+                        # the sign head's cross-entropy per event, unweighted (no sign_near_weight: a searched
+                        # training knob must not move the number it is judged by), for val_total below
+                        bce = torch.nn.functional.binary_cross_entropy_with_logits(
+                            logit.reshape(-1).float(), target.reshape(-1).float(), reduction="none")
+                        bce_sums.index_add_(0, pids, bce.to(torch.float64))
+                    if sigma is not None:
+                        mse_e = ((y_pred - y) ** 2).flatten(1).mean(dim=1).to(torch.float64)
+                        mse_sums.index_add_(0, pids, mse_e)
+                reg_val = float(self._reg_term(self.model))
+            sums, counts, mse_sums = sums.cpu().numpy(), counts.cpu().numpy(), mse_sums.cpu().numpy()
+            if getattr(self, "_sign_head", False):
+                self._val_total_proc = self._val_total_per_process(sums, counts, bce_sums.cpu().numpy())
+                acc = sign_ok.cpu().numpy() / np.maximum(counts, 1)
+                signed = np.asarray(self._proc_signed) > 0
+                if signed.any():
+                    LOGGER.info(f"sign_head: sign accuracy on the {int(signed.sum())} signed pools: "
+                                f"median {np.median(acc[signed]):.4f}, min {acc[signed].min():.4f} "
+                                f"({self.cfg.data.dataset[int(np.argmin(np.where(signed, acc, 2)))]})")
+            het = self.cfg.training.loss == "HETEROSC"
+            for p, name in enumerate(self.cfg.data.dataset):
+                if name not in self.proc_val_loaders or counts[p] == 0:
+                    continue
+                m = float(sums[p] / counts[p])
+                proc_losses_no_reg[name] = m
+                proc_losses[name]        = m + reg_val
+                proc_mse_vals[name]      = float(mse_sums[p] / counts[p]) if het else None
+        if val_mode == "check":
+            _combined = (proc_losses, proc_losses_no_reg, proc_mse_vals)
+            proc_losses, proc_losses_no_reg, proc_mse_vals = {}, {}, {}
+        if not is_lloca or val_mode in ("loop", "check"):
+          # The per-process value is the plain mean of the per-event loss. It must never go
+          # through _batch_loss: that applies training.loss_aggregation to the single-process
+          # batch, which is the mean only for mean/geometric_mean at tau = 0; with tau > 0 it
+          # is m_p + tau and under `excess` it is m_p times the process's reference weight,
+          # so the recorded validation would follow a training-side knob (the earlier
+          # reference-weighted arms recorded exactly that; docs/results.tex, catalog census).
+          if getattr(self, "_sign_head", False):
+              raise NotImplementedError("LLOCA_VAL=loop/check does not carry the sign head")
+          def _loop_loss(data):
+              if is_lloca:
+                  y_pred, y, _, sigma, mse_val = self._forward_lloca(data)
+                  loss_no_reg = self._per_event_loss(y_pred, y, sigma=sigma).mean().detach()
+                  reg = self._reg_term(self.model)
+                  return loss_no_reg + reg, loss_no_reg, mse_val
+              return self._batch_loss(data)      # legacy models: single-process batch, mean loss
+          with torch.no_grad():
+            for name, loader in self.proc_val_loaders.items():
+                losses, losses_no_reg, mse_vals = [], [], []
+                for data in loader:
+                    if self.ema is not None:
+                        with self.ema.average_parameters():
+                            loss, loss_no_reg, mse_val = _loop_loss(data)
+                    else:
+                        loss, loss_no_reg, mse_val = _loop_loss(data)
+                    losses.append(loss.cpu().item())
+                    if loss_no_reg is not None:
+                        losses_no_reg.append(loss_no_reg.item())   # now a detached tensor
+                    if mse_val is not None:
+                        mse_vals.append(float(mse_val))   # float() also materialises a detached tensor (LLoCa path)
+                proc_losses[name]        = float(np.mean(losses))
+                proc_losses_no_reg[name] = float(np.mean(losses_no_reg)) if losses_no_reg else None
+                proc_mse_vals[name]      = float(np.mean(mse_vals))      if mse_vals      else None
+        if val_mode == "check" and is_lloca:
+            # same model, both paths: report the largest per-process deviation, keep the combined
+            devs = sorted(((abs(_combined[1][n] - proc_losses_no_reg[n]) / max(abs(proc_losses_no_reg[n]), 1e-30), n)
+                           for n in proc_losses_no_reg if n in _combined[1]), reverse=True)
+            LOGGER.info(f"LLOCA_VAL=check: max per-process |combined - loop| / loop = {devs[0][0]:.3e} "
+                        f"over {len(devs)} processes; largest: "
+                        + ", ".join(f"{n}={d:.2e} (combined {_combined[1][n]:.4e}, loop {proc_losses_no_reg[n]:.4e}, "
+                                    f"n_val={int(counts[list(self.cfg.data.dataset).index(n)])})"
+                                    for d, n in devs[:5]))
+            proc_losses, proc_losses_no_reg, proc_mse_vals = _combined
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # The validation aggregate is a fixed METRIC (training.val_aggregation, default
+        # geometric_mean), decoupled from training.loss_aggregation / loss_aggregation_tau,
+        # which shape the gradient only: an aggregation A/B must not move the number it is
+        # judged by (val_loss_no_reg, checkpoint selection, the HPO objective).
+        loss_agg = self.cfg.training.get("val_aggregation", "geometric_mean")
+        # HETEROSC NLL is SIGNED: geometric_mean's log(clip(·,1e-10)) collapses every
+        # well-fit (negative) process to a constant → val_loss ≡ ~0, so best-checkpoint
+        # selection NEVER updates and a barely-trained model is saved. Match the training
+        # path: arithmetic mean for HETEROSC (see _aggregate_per_process_loss).
+        if self.cfg.training.loss == "HETEROSC":
+            loss_agg = "mean"
+
+        def _combine(vals):
+            if loss_agg == "geometric_mean":
+                return float(np.exp(np.mean(np.log(np.clip(vals, 1e-10, None)))))
+            return float(np.mean(vals))
+
+        # Combine the per-process *no-reg* MSEs first, then add the whole-model reg
+        # term ONCE — mirroring the training loss  GM_p(MSE_p) + reg.  Previously the
+        # combined val loss folded reg into each process before the geometric mean,
+        # GM_p(MSE_p + reg), a larger (reg-inflated) quantity not comparable to
+        # train_loss.  (val_loss_no_reg = GM_p(MSE_p) is unchanged, so checkpoint
+        # selection / HPO, which use the no-reg loss, are unaffected.)
+        monitors = set(getattr(self, "_monitor_names", []))
+        lnr_all = [v for v in proc_losses_no_reg.values() if v is not None]
+        lnr = [v for k, v in proc_losses_no_reg.items() if v is not None and k not in monitors]
+        if lnr:
+            val_loss_no_reg = _combine(lnr)
+            reg_val  = float(self._reg_term(self.model))
+            val_loss = val_loss_no_reg + reg_val
+        else:
+            val_loss_no_reg = None
+            val_loss = _combine(list(proc_losses.values()))
+
+        if (step + 1) % self.cfg.training.validate_every_n_steps == 0:
+            self.val_loss.append(val_loss)
+            if val_loss_no_reg is not None:
+                self.val_loss_no_reg.append(val_loss_no_reg)
+            vt = self._val_total(monitors, _combine)
+            if vt is not None:
+                # one entry per validation, aligned with val_loss_no_reg (the best checkpoint's index reads it)
+                self.val_total = getattr(self, "val_total", []) + [vt]
+            if monitors and lnr_all:
+                self.val_loss_no_reg_all = getattr(self, "val_loss_no_reg_all", []) + [_combine(lnr_all)]
+            mse = [v for v in proc_mse_vals.values() if v is not None]
+            if mse:
+                self.val_mse.append(float(np.mean(mse)))
+            #if self.cfg.use_mlflow:
+            #    log_mlflow("val.loss", val_loss, step=step)
+
+        self.proc_val_mse = proc_mse_vals   # this validation's per-process mu-MSE (HETEROSC; None otherwise), for re-reads
+        # Record per-process losses for plotting
+        for name, loss in proc_losses.items():
+            if name not in self.proc_val_losses:
+                self.proc_val_losses[name] = []
+            self.proc_val_losses[name].append(loss)
+        for name, loss in proc_losses_no_reg.items():
+            if loss is not None:
+                if name not in self.proc_val_losses_no_reg:
+                    self.proc_val_losses_no_reg[name] = []
+                self.proc_val_losses_no_reg[name].append(loss)
+
+        # the combined value includes the regularization term; the checkpoint metric (val_loss_no_reg: the aggregate
+        # without it, what selects the checkpoint and what DyHPO observes) is printed next to it, so a log read on its
+        # own gives the metric (2026-10-23: copied sweeps pruned from their logs had only the regularized value)
+        LOGGER.info(
+            f"Val loss (combined): {val_loss:.4g} | "
+            + (f"val_loss_no_reg: {val_loss_no_reg:.6e} | " if val_loss_no_reg is not None else "")
+            + ", ".join(f"{n}={v:.4g}" for n, v in proc_losses.items())
+        )
+
+        # σ-ranking SPEED probe on the MULTI-PROCESS path (this override does not
+        # call super()._validate, so the base hook can't reach here). Uses the
+        # combined self.val_loader — process_ids per event give the per-process ρ.
+        self._sigma_rank_probe(step)
+
+        # Update sampler weights (_compute_sampler_weights): each dataset's live
+        # local exponent α is fit from recent (compute, EMA-loss) history and
+        # compared to its expected SOLO exponent α_solo.  Datasets scaling BELOW
+        # solo (deficit = α_solo − α_local > 0) are under-scaling/starved and get
+        # boosted ∝ deficit; at-or-above-solo datasets stay at baseline; datasets
+        # confirmed flat (plateaued, via the significance probe) drop to a floor.
+        # Uniform during warmup.
+        if self.train_sampler is not None:
+            dataset_names = list(self.cfg.data.dataset)
+
+            # EMA-smooth the per-process validation losses before fitting α.
+            # sampler_alpha_ema is the decay: high = slow to forget, low = reactive.
+            ema_decay = self.cfg.training.get("sampler_alpha_ema", 0.7)
+            if not hasattr(self, '_proc_loss_ema'):
+                self._proc_loss_ema   = {}   # running EMA scalar per process (with reg)
+                self._proc_ema_losses = {}   # history of EMA loss values for α fit
+                # parallel EMA of the no-reg loss (same decay) — for plotting only;
+                # the sampler fits α on the with-reg EMA above.
+                self._proc_loss_ema_no_reg   = {}
+                self._proc_ema_losses_no_reg = {}
+
+            for name, loss in proc_losses.items():
+                if name not in self._proc_loss_ema:
+                    self._proc_loss_ema[name] = loss
+                else:
+                    self._proc_loss_ema[name] = (
+                        ema_decay * self._proc_loss_ema[name] + (1.0 - ema_decay) * loss
+                    )
+                self._proc_ema_losses.setdefault(name, []).append(self._proc_loss_ema[name])
+
+            for name, loss in proc_losses_no_reg.items():
+                if loss is None:
+                    continue
+                if name not in self._proc_loss_ema_no_reg:
+                    self._proc_loss_ema_no_reg[name] = loss
+                else:
+                    self._proc_loss_ema_no_reg[name] = (
+                        ema_decay * self._proc_loss_ema_no_reg[name] + (1.0 - ema_decay) * loss
+                    )
+                self._proc_ema_losses_no_reg.setdefault(name, []).append(self._proc_loss_ema_no_reg[name])
+
+            weights, statuses, alphas = self._compute_sampler_weights(dataset_names)
+            self.train_sampler.set_weights(weights)
+
+            log_every = self.cfg.training.get("sampler_log_every_n_vals", 10)
+            n_vals = len(self.val_loss)
+            if log_every > 0 and n_vals % log_every == 0:
+                defs = getattr(self, "_last_deficits", {})
+                LOGGER.info(
+                    "Sampler [α|deficit|status]: " +
+                    ", ".join(f"{short_ds_name(n)}={alphas[n]:.2f}|{defs.get(n,0):.2f}|{statuses[n][:4]}"
+                              for n in dataset_names)
+                )
+
+        return val_loss
+
+    def _val_total_per_process(self, sums, counts, bce_sums):
+        """Per process, the loss the model trains on, on its validation events: the mean per-event magnitude loss
+        plus sign_loss_weight times the sign head's mean cross-entropy on the sign-changing pools (as
+        _aggregate_per_process_loss adds it in training), without the training-only sign_near_weight. {name: value}."""
+        w = float(self.cfg.training.get("sign_loss_weight", 1.0))
+        signed = np.asarray(self._proc_signed, dtype=np.float64)
+        out = {}
+        loaders = getattr(self, "proc_val_loaders", None)
+        for p, name in enumerate(self.cfg.data.dataset):
+            # the processes val_loss_no_reg covers (a validation loader, events present)
+            if counts[p] > 0 and (loaders is None or name in loaders):
+                out[name] = float(sums[p] / counts[p] + w * signed[p] * bce_sums[p] / counts[p])
+        return out
+
+    def _val_total(self, monitors=(), combine=None):
+        """val_total: the loss the model trains on (magnitude loss plus the sign head's cross-entropy, per process),
+        on validation events of the training processes (monitor processes left out), combined over processes by the
+        validation metric's own aggregation (`combine`: _validate's, training.val_aggregation), never by a
+        training-side knob (loss_aggregation, tau), as val_loss_no_reg. Read at the selected checkpoint (the best
+        val_loss_no_reg, CLAUDE.md "Reported values"), not at its own minimum. The HPO objective of a sign-head
+        search (sweep config `objective: val_total`, sweep/run_trial.py), where val_loss_no_reg would ignore the sign
+        head. None without the sign head."""
+        per = getattr(self, "_val_total_proc", None)
+        if not getattr(self, "_sign_head", False) or not per:
+            return None
+        vals = [v for k, v in per.items() if k not in set(monitors)]
+        if not vals:
+            return None
+        if combine is None:
+            return float(np.exp(np.mean(np.log(np.clip(vals, 1e-10, None)))))
+        return combine(vals)
+
+    def _result_extra(self) -> dict:
+        """Return per-dataset val_losses and compute counts at the best checkpoint.
+
+        proc_val_losses        : {ds_name: val_loss}        at the selected checkpoint's validation
+        proc_val_losses_no_reg : {ds_name: val_loss_no_reg} at the same validation
+        compute_ds             : {ds_name: n_samples}       total samples seen from each dataset
+        """
+        if not self.proc_val_losses or not self.val_loss:
+            return {}
+        # The validation the checkpoint was selected at (base_experiment.train records it, whatever the selection
+        # metric: HETEROSC with heterosc_select=mu_mse selects on val_mse, not val_loss_no_reg); argmin of the no-reg
+        # loss only when it was not recorded.
+        best_idx = getattr(self, "_best_val_idx", None)
+        if best_idx is None:
+            ref_series = self.val_loss_no_reg if self.val_loss_no_reg else self.val_loss
+            best_idx = int(np.argmin(ref_series))
+
+        proc = {}
+        for name, losses in self.proc_val_losses.items():
+            if best_idx < len(losses):
+                proc[name] = float(losses[best_idx])
+        if not proc:
+            return {}
+
+        result = {"proc_val_losses": proc}
+        vt = getattr(self, "val_total", None)
+        if vt and best_idx < len(vt):
+            # the total validation loss (magnitude MSE + sign cross-entropy) at the selected checkpoint, and its curve
+            result["val_total"] = float(vt[best_idx])
+            result["val_total_curve"] = [float(x) for x in vt]
+
+        proc_nr = {}
+        for name, losses in self.proc_val_losses_no_reg.items():
+            if best_idx < len(losses):
+                proc_nr[name] = float(losses[best_idx])
+        if proc_nr:
+            result["proc_val_losses_no_reg"] = proc_nr
+
+        if self.train_sampler is not None:
+            dataset_names = list(self.cfg.data.dataset)
+            result["compute_ds"] = {
+                name: int(self.train_sampler.samples_per_process.get(i, 0))
+                for i, name in enumerate(dataset_names)
+            }
+
+        return result
+

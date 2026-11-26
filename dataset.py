@@ -1,0 +1,405 @@
+import os
+import numpy as np
+import torch
+from torch.utils.data import Dataset, Sampler
+from collections import defaultdict
+ 
+ 
+class AmplitudeDataset(Dataset):
+    """
+    Sparse variable-length dataset backed by contiguous numpy arrays for fast indexing.
+
+    Particles are stored as one big (N_total_particles, 4) array plus an offsets
+    array of shape (N_events, 2) where offsets[i] = [start, end] for event i.
+    This makes __getitem__ O(1) with a simple slice, avoiding the Python list
+    overhead of storing N_events separate arrays.
+
+    Each item is a 4-tuple:
+        particles    : float tensor  (n_particles_i, 4)
+        amplitude    : float tensor  (1,)
+        tokens       : long tensor   (n_particles_i,)
+        order_labels : float tensor  (n_order_features,)  — coupling order vector
+    """
+
+    def __init__(self, particles_flat, offsets, amplitudes, tokens_flat, order_labels, dtype, process_ids=None):
+        """
+        Parameters
+        ----------
+        particles_flat : np.ndarray  (N_total_particles, 4)
+        offsets        : np.ndarray  (N_events, 2)  — [start, end] per event
+        amplitudes     : np.ndarray  (N_events, 1)
+        tokens_flat    : np.ndarray  (N_total_particles,)
+        order_labels   : np.ndarray  (N_events, n_order_features)  — e.g. [n_loops, alpha_s_power]
+        dtype          : torch dtype
+        process_ids    : np.ndarray  (N_events,) int  — process index per event, or None
+        """
+        # as_tensor (not tensor) so a numpy array already in the target dtype is
+        # shared zero-copy rather than duplicated. The big flat arrays
+        # (particles_flat / tokens_flat) are passed identically to every loader
+        # (train + evals + one per process), so copying them here multiplies host
+        # RAM by the loader count — fatal at multi-million-event scale. Keeping
+        # the source arrays float32 / int64 lets all loaders view one buffer.
+        self.particles_flat = torch.as_tensor(particles_flat, dtype=dtype)
+        self.offsets        = offsets                                      # keep as numpy for slicing
+        self.amplitudes     = torch.as_tensor(amplitudes,     dtype=dtype)
+        self.tokens_flat    = torch.as_tensor(tokens_flat,    dtype=torch.long)
+        self.order_labels   = torch.as_tensor(order_labels,   dtype=dtype)
+        self.process_ids    = torch.as_tensor(process_ids, dtype=torch.long) if process_ids is not None else None
+
+    def __len__(self):
+        return len(self.amplitudes)
+
+    def __getitems__(self, indices):
+        """Fetch a whole batch with one gather from the flat arrays.
+
+        torch's map-style fetcher calls this with the batch's index list when it
+        exists, instead of `[self[i] for i in indices]` (16384 Python calls and a
+        16384-slice `torch.cat` in the collate per batch, ~0.5 s of CPU per batch:
+        the dataloading bottleneck of training and the whole cost of an evaluation
+        pass on the workers=0 loaders). The result is the collated batch already,
+        wrapped so `collate_variable_length` passes it through; the tensors are the
+        same as the per-item path's. LLOCA_FETCH=item restores the per-item path.
+        """
+        if os.environ.get("LLOCA_FETCH", "batch") == "item":
+            return [self[i] for i in indices]
+        idx    = np.asarray(indices, dtype=np.int64)
+        starts = self.offsets[idx, 0].astype(np.int64)
+        counts = (self.offsets[idx, 1] - self.offsets[idx, 0]).astype(np.int64)
+        csum   = np.cumsum(counts)
+        total  = int(csum[-1]) if len(csum) else 0
+        # gather[k] = start of the event k belongs to + k's rank within it
+        gather = np.repeat(starts - (csum - counts), counts) + np.arange(total, dtype=np.int64)
+        gather = torch.from_numpy(gather)
+        idx_t  = torch.from_numpy(idx)
+        ptr    = torch.zeros(len(idx) + 1, dtype=torch.long)
+        ptr[1:] = torch.from_numpy(csum)
+        pids = (self.process_ids[idx_t] if self.process_ids is not None
+                else torch.full((len(idx),), -1, dtype=torch.long))
+        return [_Prebatched((
+            self.particles_flat[gather],
+            self.amplitudes[idx_t],
+            self.tokens_flat[gather],
+            self.order_labels[idx_t],
+            ptr,
+            pids,
+        ))]
+
+    def __getitem__(self, idx):
+        start, end = int(self.offsets[idx, 0]), int(self.offsets[idx, 1])
+        return (
+            self.particles_flat[start:end],   # (n_particles_i, 4)
+            self.amplitudes[idx],              # (1,)
+            self.tokens_flat[start:end],       # (n_particles_i,)
+            self.order_labels[idx],            # (n_order_features,)
+            self.process_ids[idx] if self.process_ids is not None else torch.tensor(-1, dtype=torch.long),
+        )
+ 
+ 
+def build_flat_arrays(particles_list, tokens_list):
+    """
+    Convert a list of per-event arrays into a contiguous flat array + offsets.
+ 
+    Parameters
+    ----------
+    particles_list : list of np.ndarray, each (n_particles_i, 4)
+    tokens_list    : list of np.ndarray, each (n_particles_i,)
+ 
+    Returns
+    -------
+    particles_flat : (N_total_particles, 4)
+    tokens_flat    : (N_total_particles,)
+    offsets        : (N_events, 2)  int64
+    """
+    lengths   = np.array([p.shape[0] for p in particles_list], dtype=np.int64)
+    starts    = np.concatenate([[0], np.cumsum(lengths[:-1])])
+    ends      = starts + lengths
+    offsets   = np.stack([starts, ends], axis=1)             # (N, 2)
+ 
+    particles_flat = np.concatenate(particles_list, axis=0)  # (N_total, 4)
+    tokens_flat    = np.concatenate(tokens_list,    axis=0)  # (N_total,)
+ 
+    return particles_flat, tokens_flat, offsets
+ 
+ 
+class _Prebatched:
+    """A batch already collated by AmplitudeDataset.__getitems__."""
+    __slots__ = ("data",)
+
+    def __init__(self, data):
+        self.data = data
+
+
+def collate_variable_length(batch):
+    """
+    Collate (particles, amplitude, tokens, order_labels) tuples into a sparse batch.
+    A single _Prebatched element (from AmplitudeDataset.__getitems__) passes through.
+
+    Returns
+    -------
+    particles    : (N_total, 4)              flat concatenation across all events
+    amplitudes   : (B, 1)
+    tokens       : (N_total,)
+    order_labels : (B, n_order_features)     one coupling-order vector per event
+    ptr          : (B+1,)                    ptr[i] = start of event i in flat tensors
+    """
+    if len(batch) == 1 and isinstance(batch[0], _Prebatched):
+        return batch[0].data
+    particles_list    = [item[0] for item in batch]
+    amplitudes_list   = [item[1] for item in batch]
+    tokens_list       = [item[2] for item in batch]
+    order_labels_list = [item[3] for item in batch]
+    process_ids_list  = [item[4] for item in batch]
+
+    particles    = torch.cat(particles_list,       dim=0)
+    amplitudes   = torch.stack(amplitudes_list,    dim=0)
+    tokens       = torch.cat(tokens_list,          dim=0)
+    order_labels = torch.stack(order_labels_list,  dim=0)  # (B, n_order_features)
+    process_ids  = torch.stack(process_ids_list,   dim=0)  # (B,)
+
+    counts = torch.tensor([p.shape[0] for p in particles_list], dtype=torch.long)
+    ptr    = torch.zeros(len(batch) + 1, dtype=torch.long)
+    torch.cumsum(counts, dim=0, out=ptr[1:])
+
+    return particles, amplitudes, tokens, order_labels, ptr, process_ids
+
+
+class PerProcessMicroBatchSampler(Sampler):
+    """Batch sampler for training.per_process_accumulation: one micro-batch per process.
+
+    Every yielded index list holds, for each process in ascending id order, `m_p` events of
+    that process only (`m_p = min(microbatch, n_p)`), so the collated batch is grouped by
+    process and `experiment._split_by_process` cuts it into P single-process micro-batches.
+    Each process has its own stream: a permutation of its own training events, consumed
+    without replacement and reshuffled once fewer than `m_p` remain (the tail is dropped,
+    as drop_last does for the mixed loader), so the events of a micro-batch are distinct
+    and i.i.d. within the process. It runs in the main process (DataLoader batch_sampler),
+    so the workers only gather; their number does not change the streams.
+    """
+
+    def __init__(self, process_ids, microbatch, seed=0, min_batches=100):
+        pids = np.asarray(process_ids)
+        self.rng = np.random.default_rng(seed)
+        self.procs = sorted(set(pids.tolist()))
+        self.proc_indices = {p: np.flatnonzero(pids == p) for p in self.procs}
+        self.m = {p: int(min(int(microbatch), len(self.proc_indices[p]))) for p in self.procs}
+        self._pools = {p: self.rng.permutation(self.proc_indices[p]) for p in self.procs}
+        self._pos = {p: 0 for p in self.procs}
+        self.events_per_step = int(sum(self.m.values()))
+        # a floor so the loader is not re-iterated (and its workers re-armed) every few steps,
+        # as in ProcessBalancedSampler; the streams are infinite either way
+        self._n_batches = max(int(min_batches), len(pids) // max(self.events_per_step, 1))
+
+    def _draw(self, p):
+        m, pool = self.m[p], self._pools[p]
+        if self._pos[p] + m > len(pool):
+            self._pools[p] = pool = self.rng.permutation(self.proc_indices[p])
+            self._pos[p] = 0
+        out = pool[self._pos[p]:self._pos[p] + m]
+        self._pos[p] += m
+        return out
+
+    def __iter__(self):
+        for _ in range(self._n_batches):
+            yield np.concatenate([self._draw(p) for p in self.procs]).tolist()
+
+    def __len__(self):
+        return self._n_batches
+
+
+class RoundRobinMicroBatchSampler(PerProcessMicroBatchSampler):
+    """Batch sampler for training.per_process_accumulation=round_robin: the batching of
+    Bahl, Plehn, Schiller, Sivagnanalingam, arXiv:2606.23791 (their MultiDatasetBatchSampler
+    with one_process_per_batch=True, same_process_grad_accum=1, and the trainer pulling
+    gradient_accumulation_steps micro-batches per optimizer step).
+
+    Every yielded index list is ONE optimizer step: `accum_steps` (G) single-process
+    micro-batches of `m_p = min(microbatch, n_p)` events each, concatenated in schedule order.
+    The schedule is one continuous stream of process slots that the G-windows cut without
+    regard to cycle boundaries, as their trainer pulls G consecutive loader batches:
+      * order="interleaved" (their dataclass default): processes in ascending id order,
+        cycled, 0, 1, ..., P-1, 0, 1, ... A step holds G consecutive processes of the cycle
+        (G distinct ones when G <= P), and every process gets the same number of micro-batches.
+      * order="random" (what their shipped configs set, base_qwen2.yaml): each cycle is a
+        uniform permutation of K slots per process, K = max(1, min_p n_p // microbatch) (their
+        epoch: every process truncated to the smallest one's whole batches); same-process
+        micro-batches may follow each other, also inside a step.
+    The schedule position persists across re-iterations of the loader, so the cycle never
+    restarts at a loader epoch. Within a process, the events come from its own stream (see
+    PerProcessMicroBatchSampler): distinct within a micro-batch, a fresh permutation of the
+    process's training events once one is used up. Their sampler instead truncates every
+    process to the smallest one's size per epoch and, at their default per_epoch_resample=False,
+    replays the same events in the same order every epoch (their trainer.py documents it as a
+    known bug); the streams here are what their per_epoch_resample=True fix intends, without the
+    truncation (here every event of a large process is used).
+    Consecutive same-process micro-batches in a step are one contiguous run of the batch;
+    experiment._split_microbatches cuts it back at m_p.
+    """
+
+    def __init__(self, process_ids, microbatch, accum_steps, order="interleaved", seed=0,
+                 min_batches=100):
+        super().__init__(process_ids, microbatch, seed=seed, min_batches=min_batches)
+        if order not in ("interleaved", "random"):
+            raise ValueError(f"accumulation_order must be interleaved or random, got {order!r}")
+        self.G = int(accum_steps)
+        if self.G < 1:
+            raise ValueError(f"accumulation_steps must be >= 1, got {accum_steps}")
+        self.order = order
+        self.K = max(1, min(len(v) for v in self.proc_indices.values()) // int(microbatch))
+        self._cycle, self._cpos = [], 0
+        mean_m = float(np.mean(list(self.m.values())))
+        self.events_per_step = int(round(self.G * mean_m))   # exact when no process is capped
+        self._n_batches = max(int(min_batches), len(np.asarray(process_ids)) // max(self.events_per_step, 1))
+
+    def _next_proc(self):
+        if self._cpos >= len(self._cycle):
+            if self.order == "interleaved":
+                self._cycle = list(self.procs)
+            else:
+                slots = np.repeat(np.asarray(self.procs), self.K)
+                self._cycle = self.rng.permutation(slots).tolist()
+            self._cpos = 0
+        p = self._cycle[self._cpos]
+        self._cpos += 1
+        return p
+
+    def __iter__(self):
+        for _ in range(self._n_batches):
+            yield np.concatenate([self._draw(self._next_proc()) for _ in range(self.G)]).tolist()
+
+
+class ProcessBalancedSampler(Sampler):
+    """
+    Yields batches where each process contributes equally (or according to
+    dynamically updated weights).
+
+    At each step, draws `batch_size // n_processes` indices from each process,
+    then shuffles them together to form one batch.  When a process runs out of
+    indices it reshuffles its own pool — so no process is ever exhausted.
+
+    Weights are updated via `set_weights(weights)` where weights is a list of
+    non-negative floats (one per process).  A weight of 0 disables that process.
+    Internally weights are normalised to allocate slots per batch.
+
+    Parameters
+    ----------
+    process_ids : np.ndarray  (N_events,)
+        Integer process index for every event in the dataset (after shuffling).
+    batch_size : int
+    weights : list[float] | None
+        Initial sampling weights per process.  Defaults to uniform.
+    seed : int
+    """
+
+    def __init__(self, process_ids, batch_size, weights=None, seed=0,
+                 min_proc_frac=0.2):
+        self.process_ids  = np.asarray(process_ids)
+        self.batch_size   = batch_size
+        self.seed         = seed
+        self.min_proc_frac = min_proc_frac   # minimum fraction of uniform share per process
+        self.rng         = np.random.default_rng(seed)
+
+        # indices per process
+        unique = sorted(set(self.process_ids.tolist()))
+        self.n_processes = len(unique)
+        self.proc_indices = {
+            p: np.where(self.process_ids == p)[0] for p in unique
+        }
+        # shuffled pools (refilled on exhaustion)
+        self._pools = {p: self._shuffle(p) for p in unique}
+        self._pool_pos = defaultdict(int)
+
+        if weights is None:
+            weights = [1.0] * self.n_processes
+        self._weights = np.array(weights, dtype=float)
+
+        # total number of batches per "epoch".
+        # Using min_proc_size caused _n_batches=1 for imbalanced datasets (e.g. n_aa=300
+        # gives only ~120 training events → min*3//512=0 → max(1,0)=1).  With
+        # persistent_workers=True, iter(DataLoader) is called every step, leaving workers
+        # idle between steps; on a busy cluster the OS scheduling wake-up latency is
+        # 150-400 ms and is counted directly in avg_iter_time via next(iterator).
+        # Fix: size on total data with a floor of 100 so workers stay continuously busy.
+        total_proc_size = sum(len(v) for v in self.proc_indices.values())
+        self._n_batches = max(100, total_proc_size // batch_size)
+
+        # Compute tracking: total samples yielded per process
+        self._samples_per_process: dict = {p: 0 for p in unique}
+        # Snapshot of sample counts at each validation step (recorded via record_snapshot)
+        self._compute_snapshots: list = []
+
+    def _shuffle(self, p):
+        idx = self.proc_indices[p].copy()
+        self.rng.shuffle(idx)
+        return idx
+
+    def record_snapshot(self):
+        """Snapshot current per-process sample counts (call at the start of each validation)."""
+        self._compute_snapshots.append(dict(self._samples_per_process))
+
+    @property
+    def samples_per_process(self) -> dict:
+        """Total samples yielded per process integer ID since training started."""
+        return dict(self._samples_per_process)
+
+    @property
+    def compute_snapshots(self) -> list:
+        """List of sample-count dicts, one per validation step (from record_snapshot calls)."""
+        return self._compute_snapshots
+
+    def set_weights(self, weights):
+        """Update sampling weights (called after each validation)."""
+        w = np.array(weights, dtype=float)
+        w = np.clip(w, 0, None)
+        self._weights = w
+
+    def _slots_per_process(self):
+        """Allocate batch slots proportionally to weights, at least 1 per active process."""
+        w = self._weights.copy()
+        total = w.sum()
+        if total == 0:
+            w = np.ones(self.n_processes, dtype=float)
+            total = float(self.n_processes)
+        slots = np.floor(w / total * self.batch_size).astype(int)
+        # ensure each active process gets at least min_proc_frac of its uniform share,
+        # so that no dataset is starved and its alpha_eff estimate stays well-conditioned
+        min_slots = max(1, int(self.batch_size * self.min_proc_frac / self.n_processes))
+        slots = np.maximum(slots, (w > 0).astype(int) * min_slots)
+        # distribute remaining slots to highest-weight processes
+        remainder = self.batch_size - slots.sum()
+        if remainder > 0:
+            order = np.argsort(-w)
+            for i in order[:remainder]:
+                slots[i] += 1
+        return slots
+
+    def _next(self, p, n):
+        """Draw n indices from process p, refilling pool as needed."""
+        out = []
+        while len(out) < n:
+            pos   = self._pool_pos[p]
+            pool  = self._pools[p]
+            avail = len(pool) - pos
+            need  = n - len(out)
+            if avail >= need:
+                out.extend(pool[pos:pos + need].tolist())
+                self._pool_pos[p] = pos + need
+            else:
+                out.extend(pool[pos:].tolist())
+                self._pools[p]    = self._shuffle(p)
+                self._pool_pos[p] = 0
+        return out
+
+    def __iter__(self):
+        for _ in range(self._n_batches):
+            slots   = self._slots_per_process()
+            procs   = sorted(self.proc_indices.keys())
+            batch   = []
+            for p, n in zip(procs, slots):
+                if n > 0:
+                    self._samples_per_process[p] += n
+                    batch.extend(self._next(p, n))
+            self.rng.shuffle(batch)
+            yield from batch
+
+    def __len__(self):
+        return self._n_batches * self.batch_size

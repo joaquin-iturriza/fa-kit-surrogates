@@ -1,0 +1,547 @@
+"""Turn ``<process>.diagrams.json`` sidecars into batched graph tensors.
+
+Each physics process owns a *set* of Feynman diagrams (emitted by
+``tools/dump_diagrams.py``). This module loads that set and materialises, per
+process, a dense padded tensor bundle that the diagram encoder
+(``models/diagram_encoder.py``) consumes to produce one conditioning vector
+``E(process)``.
+
+Design choices
+--------------
+* **Dense, not message-passing.** Individual diagrams are tiny (a handful of
+  nodes), so we pad to ``max_nodes`` and run masked attention. This matches the
+  paper's *graph transformer* (attention over nodes with edge-conditioned bias,
+  arXiv:2606.23791 Eq. 19) and avoids a torch_geometric dependency on the hot
+  path. The big axis is the number of diagrams ``D`` (up to a few thousand for
+  high-multiplicity processes); ``max_nodes`` stays small.
+
+* **Particles encoded by physical properties, not a learned PID embedding.** A
+  leg/propagator's identity enters through the project's
+  ``build_property_matrix`` row for its PDG id — the *same* physical-quantity
+  encoding used for real particles — so a Z- vs gamma-propagator is told apart
+  by mass/charge and a new mediator slots in zero-shot. Self-conjugate
+  propagators come out of MadGraph with an orientation-dependent sign
+  (e.g. ``-22`` for the photon); :func:`_pdg_index` canonicalises ``pdg``→``-pdg``.
+
+* **Vertices carry coupling order.** Interaction vertices contribute their
+  (QED, QCD, ...) powers as node features, tying the diagram channel to the same
+  perturbative-order information ``amp_orders`` already feeds the model.
+
+Node feature layout (per node)::
+
+    [ property_vector(n_prop) | is_external, is_vertex | is_in, is_out | order_powers(n_orders) ]
+
+External nodes fill the property block (their leg particle) and the state flags;
+vertex nodes fill the order-power block. Laplacian positional encoding is stored
+separately (``lap_pe``) so the encoder can project it on its own axis.
+"""
+
+import json
+import os
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+
+from particle_ids import (build_property_matrix, GLOBAL_PDG_IDX,
+                          GLOBAL_PROPERTY_MATRIX, PARTICLE_FEATURE_NAMES, _MASSLESS)
+
+_MASS_COL = PARTICLE_FEATURE_NAMES.index("log10_mass_gev")
+
+
+def _phys_mass(pdg, override=None):
+    """Physical mass (GeV) of a PDG from the raw property table; ``override`` (a
+    dict pdg→mass, e.g. a scanned propagator mass) wins. Massless sentinel → 0.
+    Canonicalises signed self-conjugate ids (−23 → 23)."""
+    if override:
+        if pdg in override:  return float(override[pdg])
+        if -pdg in override: return float(override[-pdg])
+    idx = GLOBAL_PDG_IDX.get(pdg) or GLOBAL_PDG_IDX.get(-pdg)
+    if idx is None:
+        return 0.0
+    lm = float(GLOBAL_PROPERTY_MATRIX[idx][_MASS_COL])
+    return 0.0 if abs(lm - _MASSLESS) < 1e-6 else float(10.0 ** lm)
+
+
+# Default coupling-order channels exposed as vertex features, in fixed order.
+DEFAULT_ORDER_KEYS = ("QED", "QCD")
+
+
+def _pdg_index(pdg, pdg_to_idx):
+    """Row index of ``pdg`` in the property matrix, canonicalising sign.
+
+    MadGraph orients self-conjugate propagators arbitrarily (``-22`` photon,
+    ``-23`` Z, ``-25`` Higgs), so fall back to ``-pdg`` when the signed id is
+    absent. Returns 0 (the all-zero padding row) for an unknown id, after a
+    warning — an unknown propagator should be rare and must not abort loading.
+    """
+    if pdg in pdg_to_idx:
+        return pdg_to_idx[pdg]
+    if -pdg in pdg_to_idx:
+        return pdg_to_idx[-pdg]
+    import warnings
+    warnings.warn(f"diagram_graphs: PDG {pdg} not in property table; using zero row.")
+    return 0
+
+
+def propagator_leg_sets(graph):
+    """External-leg set carried by each INTERNAL propagator edge of a tree diagram.
+
+    Removing an internal edge splits the tree in two; the external legs in one
+    component fix the propagator momentum p_prop = Σ_{legs in set} p_leg (all-
+    outgoing convention), and its virtuality is s = p_prop² — the pole structure
+    1/(s−m²) that *is* the amplitude (Tier B). By momentum conservation
+    (Σ_A p)² = (Σ_B p)², so either side gives the same s; we return the side
+    containing edge endpoint ``u``.
+
+    Returns ``[(u, v, frozenset(leg_numbers))]`` over internal edges.
+    """
+    nodes, edges = graph["nodes"], graph["edges"]
+    adj = {i: [] for i in range(len(nodes))}
+    for e in edges:
+        adj[e["u"]].append(e["v"])
+        adj[e["v"]].append(e["u"])
+    leg_of = {i: (n.get("leg_number") if n["kind"] == "external" else None)
+              for i, n in enumerate(nodes)}
+
+    def component_legs(start, blocked):
+        seen, stack, legs = {start}, [start], set()
+        while stack:
+            x = stack.pop()
+            if leg_of[x] is not None:
+                legs.add(leg_of[x])
+            for y in adj[x]:
+                if {x, y} == blocked or y in seen:
+                    continue
+                seen.add(y); stack.append(y)
+        return legs
+
+    out = []
+    for e in edges:
+        if e["external"]:
+            continue
+        legs = component_legs(e["u"], {e["u"], e["v"]})
+        out.append((e["u"], e["v"], frozenset(legs), int(e.get("pdg", 0))))
+    return out
+
+
+def leg_to_slot(external, slot_pdgs, n_initial):
+    """Map MadGraph leg number → event particle-slot index by (pdg, state).
+
+    The dataset's per-particle slot order does NOT equal MadGraph's leg order
+    (e.g. ee→ttbar stores [e-, e+, t, t̄] while MG5 numbers them [e+, e-, t, t̄]),
+    so we match each leg to a slot by PDG id and initial/final state (the first
+    ``n_initial`` slots are initial-state). Ties among identical particles are
+    broken by slot order — a canonical but arbitrary choice; for processes with
+    identical final-state particles (γγγ, ggg, …) the per-diagram virtuality is
+    only defined up to that permutation, which the diagram pooling averages over.
+
+    Returns ``{leg_number: slot_index}``.
+    """
+    used, mapping = set(), {}
+    for leg in sorted(external, key=lambda d: d["number"]):
+        want_in = (leg["state"] == "in")
+        for s in range(len(slot_pdgs)):
+            if s in used:
+                continue
+            if slot_pdgs[s] == leg["pdg"] and (s < n_initial) == want_in:
+                mapping[leg["number"]] = s
+                used.add(s)
+                break
+    return mapping
+
+
+def _undirected_adjacency(edges, n_nodes):
+    """Dense symmetric 0/1 adjacency (no self-loops) from an edge list."""
+    a = np.zeros((n_nodes, n_nodes), dtype=np.float64)
+    for e in edges:
+        u, v = e["u"], e["v"]
+        if u == v:
+            continue
+        a[u, v] = 1.0
+        a[v, u] = 1.0
+    return a
+
+
+def _laplacian_pe(adj, k):
+    """First ``k`` non-trivial eigenvectors of the symmetric-normalised Laplacian.
+
+    L_sym = I - D^{-1/2} A D^{-1/2}. We drop the trivial (smallest) eigenvector
+    and take the next ``k`` (the standard graph-transformer LapPE). Fewer than
+    ``k`` available (small graphs) → zero-padded. Sign of each eigenvector is
+    arbitrary; we leave it fixed here (callers may randomise signs per step as a
+    standard LapPE augmentation).
+    Returns ``(n_nodes, k)``.
+    """
+    n = adj.shape[0]
+    pe = np.zeros((n, k), dtype=np.float32)
+    if n <= 1:
+        return pe
+    deg = adj.sum(axis=1)
+    dinv = np.where(deg > 0, 1.0 / np.sqrt(deg), 0.0)
+    lap = np.eye(n) - (dinv[:, None] * adj * dinv[None, :])
+    # symmetric -> eigh gives ascending real eigenvalues / orthonormal vectors
+    _, vecs = np.linalg.eigh(lap)
+    take = min(k, n - 1)            # skip the trivial first eigenvector
+    pe[:, :take] = vecs[:, 1:1 + take]
+    return pe
+
+
+@dataclass
+class ProcessDiagrams:
+    """Dense padded graph bundle for one process's full diagram set.
+
+    Shapes (D = #diagrams across all subprocesses, N = max nodes, ...):
+      node_feat : (D, N, F_node)   float   per-node features (see module docstring)
+      lap_pe    : (D, N, K)        float   Laplacian positional encoding
+      node_mask : (D, N)           bool    True for real (non-padding) nodes
+      edge_feat : (D, N, N, F_edge) float  per-edge features (property vec + flags); 0 if no edge
+      edge_mask : (D, N, N)        bool    True where an edge exists
+      leg_slot  : (D, N)           long    external leg number (1-based) per external node; -1 else
+      leg_pdg   : (D, N)           long    external leg PDG per external node; 0 else
+    The leg_slot/leg_pdg arrays carry the diagram↔event correspondence needed for
+    the Tier-B per-event propagator-virtuality features.
+
+    prop_leg_sets : list (len D) of list of (i, j, tuple(leg_numbers)) — for each
+      diagram, the internal propagator edges and the external-leg set whose
+      momentum sum gives that propagator's virtuality s=(Σp)² (Tier B). Plain
+      Python (ragged, device-independent); the experiment turns the leg numbers
+      into a per-event momentum-gather mask once the event slot order is known.
+    external : list of {number, pdg, state} — the process's external legs (from the
+      first subprocess); used with the event slot order to build the leg→slot map.
+    n_subprocesses : int — >1 means flavour-summed (ee_qqbar): the per-event leg↔slot
+      map is ambiguous, so Tier-B virtuality is skipped for it.
+    """
+    node_feat: torch.Tensor
+    lap_pe: torch.Tensor
+    node_mask: torch.Tensor
+    edge_feat: torch.Tensor
+    edge_mask: torch.Tensor
+    leg_slot: torch.Tensor
+    leg_pdg: torch.Tensor
+    prop_leg_sets: list = None
+    external: list = None
+    n_subprocesses: int = 1
+
+    @property
+    def n_diagrams(self):
+        return self.node_feat.shape[0]
+
+    @property
+    def f_node(self):
+        return self.node_feat.shape[-1]
+
+    @property
+    def f_edge(self):
+        return self.edge_feat.shape[-1]
+
+    def to(self, device):
+        return ProcessDiagrams(
+            node_feat=self.node_feat.to(device),
+            lap_pe=self.lap_pe.to(device),
+            node_mask=self.node_mask.to(device),
+            edge_feat=self.edge_feat.to(device),
+            edge_mask=self.edge_mask.to(device),
+            leg_slot=self.leg_slot.to(device),
+            leg_pdg=self.leg_pdg.to(device),
+            prop_leg_sets=self.prop_leg_sets,   # ragged Python data; device-independent
+            external=self.external,
+            n_subprocesses=self.n_subprocesses,
+        )
+
+
+def feature_dims(n_prop, order_keys=DEFAULT_ORDER_KEYS, with_couplings=False):
+    """(F_node, F_edge) for a given property width and order-key set.
+
+    ``with_couplings`` adds one vertex column per order key carrying the per-vertex
+    log coupling-*factor* (``order_power · log(alpha_key)``) — the numeric coupling
+    VALUE, not just its power. See :func:`build_process_diagrams`.
+    """
+    n_orders = len(order_keys)
+    f_node = n_prop + 2 + 2 + n_orders   # prop | type(2) | state(2) | orders
+    if with_couplings:
+        f_node += n_orders               # + per-vertex log coupling-factor
+    f_edge = n_prop + 1                  # prop | is_external
+    return f_node, f_edge
+
+
+def build_process_diagrams(source, prop_matrix, k_pe=8, order_keys=DEFAULT_ORDER_KEYS,
+                           max_diagrams=None, couplings=None):
+    """Build a :class:`ProcessDiagrams` from a sidecar path/dict.
+
+    Parameters
+    ----------
+    source : str | dict
+        Path to ``<process>.diagrams.json`` or an already-loaded payload dict.
+    prop_matrix : np.ndarray (GLOBAL_N_ENTRIES, n_prop)
+        Physical-property rows indexed by ``GLOBAL_PDG_IDX`` — pass the SAME
+        matrix (same smart-encoding flags) the main model uses for particles, so
+        the diagram channel shares the particle encoding. Row 0 is padding.
+    k_pe : int
+        Laplacian PE dimension.
+    order_keys : tuple[str]
+        Coupling-order channels to expose as vertex features, in fixed order.
+    max_diagrams : int | None
+        If set, keep at most this many diagrams (a guard for high-multiplicity
+        processes such as ``qqbar_Zgggg`` with >2000 diagrams). Diagrams are kept
+        in MadGraph order; the drop count is reported by the caller via
+        :func:`load_diagram_registry`. ``None`` keeps all.
+    couplings : dict[str, float] | None
+        Per-dataset numeric coupling VALUES keyed by order name, e.g.
+        ``{"QED": alpha_ew, "QCD": alpha_s}``. When given, each vertex gets an
+        extra column per order key holding ``order_power · log(alpha_key)`` — the
+        log of that vertex's coupling factor — so the diagram channel carries the
+        actual coupling magnitude, not just its perturbative power. Fully general:
+        any order key MadGraph tracks (QED/QCD/BSM) is handled the same way; a key
+        absent from ``couplings`` (or a non-positive value) contributes 0. ``None``
+        ⇒ no coupling columns (back-compatible).
+    """
+    if isinstance(source, str):
+        with open(source) as f:
+            payload = json.load(f)
+    else:
+        payload = source
+
+    prop_matrix = np.asarray(prop_matrix, dtype=np.float32)
+    n_prop = prop_matrix.shape[1]
+    n_orders = len(order_keys)
+    with_couplings = couplings is not None
+    f_node, f_edge = feature_dims(n_prop, order_keys, with_couplings=with_couplings)
+    # log(alpha_key) per order key (0 where absent / non-positive → factor 1)
+    log_coupling = np.array(
+        [np.log(couplings[k]) if (with_couplings and couplings.get(k, 0) > 0) else 0.0
+         for k in order_keys], dtype=np.float32)
+
+    # Flatten every subprocess's diagrams into one list (a process embeds over its
+    # whole diagram set; multi-flavour processes like ee_qqbar pool over flavours).
+    diagrams = []
+    for sub in payload["subprocesses"]:
+        diagrams.extend(sub["diagrams"])
+    if max_diagrams is not None and len(diagrams) > max_diagrams:
+        diagrams = diagrams[:max_diagrams]
+
+    if not diagrams:
+        raise ValueError(f"no diagrams in {source!r}")
+
+    max_nodes = max(len(g["nodes"]) for g in diagrams)
+    D = len(diagrams)
+
+    node_feat = np.zeros((D, max_nodes, f_node), dtype=np.float32)
+    lap_pe = np.zeros((D, max_nodes, k_pe), dtype=np.float32)
+    node_mask = np.zeros((D, max_nodes), dtype=bool)
+    edge_feat = np.zeros((D, max_nodes, max_nodes, f_edge), dtype=np.float32)
+    edge_mask = np.zeros((D, max_nodes, max_nodes), dtype=bool)
+    leg_slot = np.full((D, max_nodes), -1, dtype=np.int64)
+    leg_pdg = np.zeros((D, max_nodes), dtype=np.int64)
+    prop_leg_sets = []   # per diagram: [(i, j, tuple(leg_numbers)), ...] internal edges
+
+    # node feature column offsets
+    c_type = n_prop            # is_external, is_vertex
+    c_state = c_type + 2       # is_in, is_out
+    c_order = c_state + 2      # order powers
+    c_coupl = c_order + n_orders   # per-vertex log coupling-factor (if with_couplings)
+
+    for di, g in enumerate(diagrams):
+        nodes, edges = g["nodes"], g["edges"]
+        nn = len(nodes)
+        node_mask[di, :nn] = True
+
+        for ni, node in enumerate(nodes):
+            if node["kind"] == "external":
+                idx = _pdg_index(int(node["pdg"]), GLOBAL_PDG_IDX)
+                node_feat[di, ni, :n_prop] = prop_matrix[idx]
+                node_feat[di, ni, c_type + 0] = 1.0       # is_external
+                if node.get("state") == "out":
+                    node_feat[di, ni, c_state + 1] = 1.0  # is_out
+                else:
+                    node_feat[di, ni, c_state + 0] = 1.0  # is_in
+                if node.get("leg_number") is not None:
+                    leg_slot[di, ni] = int(node["leg_number"])
+                    leg_pdg[di, ni] = int(node["pdg"])
+            else:  # vertex
+                node_feat[di, ni, c_type + 1] = 1.0       # is_vertex
+                orders = node.get("orders", {})
+                for oi, key in enumerate(order_keys):
+                    power = float(orders.get(key, 0))
+                    node_feat[di, ni, c_order + oi] = power
+                    if with_couplings:
+                        # log of this vertex's coupling factor: log(alpha_key^power)
+                        node_feat[di, ni, c_coupl + oi] = power * log_coupling[oi]
+
+        for e in edges:
+            u, v = e["u"], e["v"]
+            idx = _pdg_index(int(e["pdg"]), GLOBAL_PDG_IDX)
+            feat = np.zeros(f_edge, dtype=np.float32)
+            feat[:n_prop] = prop_matrix[idx]
+            feat[n_prop] = 1.0 if e.get("external") else 0.0
+            for (a, b) in ((u, v), (v, u)):     # symmetric
+                edge_feat[di, a, b] = feat
+                edge_mask[di, a, b] = True
+
+        adj = _undirected_adjacency(edges, nn)
+        lap_pe[di, :nn] = _laplacian_pe(adj, k_pe)
+
+        prop_leg_sets.append(
+            [(u, v, tuple(sorted(s)), pdg) for (u, v, s, pdg) in propagator_leg_sets(g)])
+
+    return ProcessDiagrams(
+        node_feat=torch.from_numpy(node_feat),
+        lap_pe=torch.from_numpy(lap_pe),
+        node_mask=torch.from_numpy(node_mask),
+        edge_feat=torch.from_numpy(edge_feat),
+        edge_mask=torch.from_numpy(edge_mask),
+        leg_slot=torch.from_numpy(leg_slot),
+        leg_pdg=torch.from_numpy(leg_pdg),
+        prop_leg_sets=prop_leg_sets,
+        external=payload["subprocesses"][0]["external"],
+        n_subprocesses=len(payload["subprocesses"]),
+    )
+
+
+def build_process_virtuality(pd, slot_pdgs, n_initial, mass_override=None, offshell=False):
+    """Precompute the per-event propagator-virtuality gather for one process (Tier B).
+
+    Given the event's per-slot PDG order (``slot_pdgs``) and the number of
+    initial-state particles, map each internal propagator's external-leg set to a
+    signed (all-outgoing) momentum-gather row over the event's particle slots, so at
+    runtime ``s = (Σ sign·p_slot)²`` per propagator is one einsum + Minkowski norm.
+
+    Returns a dict of tensors (mask (K,n_part) signed, diag_idx/i_idx/j_idx (K,),
+    plus n_part/D/N) for the K internal edges across the process's D diagrams, or
+    None when it can't be built (flavour-summed process, or legs unmappable).
+    """
+    if pd.n_subprocesses != 1 or pd.external is None or pd.prop_leg_sets is None:
+        return None
+    n_part = len(slot_pdgs)
+    legmap = leg_to_slot(pd.external, list(slot_pdgs), n_initial)   # {leg_number: slot}
+    if len(legmap) != len(pd.external):
+        return None
+    # all-outgoing sign per slot: initial-state momenta flip sign
+    sign = [-1.0 if s < n_initial else 1.0 for s in range(n_part)]
+
+    masks, diag_idx, i_idx, j_idx, prop_pdgs = [], [], [], [], []
+    for d, edges in enumerate(pd.prop_leg_sets):
+        for (i, j, legs, pdg) in edges:
+            if any(L not in legmap for L in legs):
+                continue
+            row = [0.0] * n_part
+            for L in legs:
+                s = legmap[L]
+                row[s] = sign[s]
+            masks.append(row)
+            diag_idx.append(d); i_idx.append(i); j_idx.append(j); prop_pdgs.append(pdg)
+    if not masks:
+        return None
+    # Per-propagator mass² (physical GeV²) so the Tier-B feature can be the propagator
+    # OFF-SHELLNESS s − m² (the pole variable 1/(s−m²)), not raw s. ``mass_override``
+    # supplies scanned propagator masses (e.g. a M_Z scan); others use the table.
+    # None when off (raw-s behaviour unchanged for existing runs).
+    prop_mass2 = None
+    if offshell:
+        prop_mass2 = torch.tensor(
+            [_phys_mass(p, mass_override) ** 2 for p in prop_pdgs], dtype=torch.float32)
+    diag_idx = torch.tensor(diag_idx, dtype=torch.long)
+    i_idx = torch.tensor(i_idx, dtype=torch.long)
+    j_idx = torch.tensor(j_idx, dtype=torch.long)
+    # propagator property vector per internal edge (incl. its mass) — lets the
+    # "pool" mode learn resonance s≈m² (virtuality alone can't tell a γ- from a
+    # Z-propagator when both carry the same s).
+    edge_prop = pd.edge_feat[diag_idx, i_idx, j_idx]                     # (K, f_edge)
+    return {
+        "mask": torch.tensor(masks, dtype=torch.float32),   # (K, n_part) signed
+        "diag_idx": diag_idx,
+        "i_idx": i_idx,
+        "j_idx": j_idx,
+        "edge_prop": edge_prop,
+        "prop_mass2": prop_mass2,                           # (K,) physical GeV²
+        "prop_pdgs": list(prop_pdgs),                       # (K,) propagator PDG per edge
+        "n_part": n_part,
+        "D": pd.n_diagrams,
+        "N": pd.node_feat.shape[1],
+    }
+
+
+def build_diagram_batch(pd_by_pid):
+    """Concatenate every process's diagrams into ONE padded batch for a single
+    encoder forward (instead of one small forward per process — kernel-launch
+    bound). Pads all diagrams to the global max node count and tags each diagram
+    with its process id for a segmented pool.
+
+    pd_by_pid : list indexed by process_id of ProcessDiagrams | None.
+    Returns a dict of stacked tensors + ``seg`` (process id per diagram) + ``n_proc``,
+    or None if no process has diagrams. ``edge_feat``/etc. keep their static (Tier-A)
+    width; the per-event Tier-B path uses forward_per_event instead.
+    """
+    pds = [(pid, pd) for pid, pd in enumerate(pd_by_pid) if pd is not None]
+    if not pds:
+        return None
+    n_proc = len(pd_by_pid)
+    M = max(pd.node_feat.shape[1] for _, pd in pds)             # global max nodes
+    F_node = pds[0][1].node_feat.shape[-1]
+    K = pds[0][1].lap_pe.shape[-1]
+    F_edge = pds[0][1].edge_feat.shape[-1]
+    total_D = sum(pd.n_diagrams for _, pd in pds)
+
+    nf = torch.zeros(total_D, M, F_node)
+    lp = torch.zeros(total_D, M, K)
+    nm = torch.zeros(total_D, M, dtype=torch.bool)
+    ef = torch.zeros(total_D, M, M, F_edge)
+    em = torch.zeros(total_D, M, M, dtype=torch.bool)
+    seg = torch.zeros(total_D, dtype=torch.long)
+    off = 0
+    for pid, pd in pds:
+        D, N = pd.node_feat.shape[0], pd.node_feat.shape[1]
+        nf[off:off + D, :N] = pd.node_feat
+        lp[off:off + D, :N] = pd.lap_pe
+        nm[off:off + D, :N] = pd.node_mask
+        ef[off:off + D, :N, :N] = pd.edge_feat
+        em[off:off + D, :N, :N] = pd.edge_mask
+        seg[off:off + D] = pid
+        off += D
+    return {"node_feat": nf, "lap_pe": lp, "node_mask": nm,
+            "edge_feat": ef, "edge_mask": em, "seg": seg, "n_proc": n_proc}
+
+
+def load_diagram_registry(diagrams_dir, process_names, spin_onehot=False,
+                          color_onehot=False, is_massless=False, standardize=False,
+                          generation_onehot=False, generation_feature=True, k_pe=8, order_keys=DEFAULT_ORDER_KEYS, max_diagrams=None,
+                          logger=None, couplings_by_process=None):
+    """Load a ``{process_name: ProcessDiagrams}`` registry for the given processes.
+
+    The property matrix is built ONCE with the supplied smart-encoding flags (pass
+    the same ones the experiment uses for particles) and shared across processes.
+    Missing sidecars are reported and skipped (the caller decides whether to error
+    or run without a diagram for that process).
+
+    ``couplings_by_process`` : dict[name → {order_key: alpha}] | None. When given,
+    each process's vertices get the per-vertex log coupling-factor columns from its
+    own coupling values (see :func:`build_process_diagrams`). A name absent from the
+    dict gets no coupling columns — so either pass values for ALL processes or none,
+    to keep F_node uniform across the batch.
+    """
+    prop_matrix, _ = build_property_matrix(
+        spin_onehot=spin_onehot, color_onehot=color_onehot,
+        is_massless=is_massless, standardize=standardize,
+        generation_onehot=generation_onehot, generation_feature=generation_feature,
+    )
+    registry = {}
+    for name in process_names:
+        path = os.path.join(diagrams_dir, f"{name}.diagrams.json")
+        if not os.path.exists(path):
+            msg = f"diagram_graphs: no sidecar for process '{name}' at {path}"
+            if logger is not None:
+                logger.warning(msg)
+            else:
+                import warnings
+                warnings.warn(msg)
+            continue
+        couplings = (couplings_by_process or {}).get(name)
+        pd = build_process_diagrams(
+            path, prop_matrix, k_pe=k_pe, order_keys=order_keys,
+            max_diagrams=max_diagrams, couplings=couplings,
+        )
+        registry[name] = pd
+        if logger is not None:
+            logger.info(f"  diagrams[{name}]: D={pd.n_diagrams} maxN={pd.node_feat.shape[1]} "
+                        f"F_node={pd.f_node} F_edge={pd.f_edge}")
+    return registry, prop_matrix.shape[1]

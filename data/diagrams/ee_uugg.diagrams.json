@@ -1,0 +1,2288 @@
+{
+  "process": "ee_uugg",
+  "model": "sm",
+  "mg5_generate": [
+    "generate e+ e- > u u~ g g"
+  ],
+  "n_subprocesses": 1,
+  "subprocesses": [
+    {
+      "process_str": "e+ e- > u u~ g g WEIGHTED<=6 @1",
+      "external": [
+        {
+          "number": 1,
+          "pdg": -11,
+          "state": "in"
+        },
+        {
+          "number": 2,
+          "pdg": 11,
+          "state": "in"
+        },
+        {
+          "number": 3,
+          "pdg": 2,
+          "state": "out"
+        },
+        {
+          "number": 4,
+          "pdg": -2,
+          "state": "out"
+        },
+        {
+          "number": 5,
+          "pdg": 21,
+          "state": "out"
+        },
+        {
+          "number": 6,
+          "pdg": 21,
+          "state": "out"
+        }
+      ],
+      "n_diagrams": 16,
+      "diagrams": [
+        {
+          "nodes": [
+            {
+              "kind": "vertex",
+              "interaction_id": 34,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 55,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 1,
+              "pdg": -11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 2,
+              "pdg": 11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 3,
+              "pdg": 2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 5,
+              "pdg": 21,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 4,
+              "pdg": -2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 6,
+              "pdg": 21,
+              "state": "out"
+            }
+          ],
+          "edges": [
+            {
+              "u": 0,
+              "v": 4,
+              "pdg": -11,
+              "external": true,
+              "leg_number": 1
+            },
+            {
+              "u": 5,
+              "v": 0,
+              "pdg": 11,
+              "external": true,
+              "leg_number": 2
+            },
+            {
+              "u": 2,
+              "v": 0,
+              "pdg": -22,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 1,
+              "v": 6,
+              "pdg": 2,
+              "external": true,
+              "leg_number": 3
+            },
+            {
+              "u": 1,
+              "v": 7,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 5
+            },
+            {
+              "u": 3,
+              "v": 1,
+              "pdg": 2,
+              "external": false,
+              "leg_number": 3
+            },
+            {
+              "u": 8,
+              "v": 2,
+              "pdg": -2,
+              "external": true,
+              "leg_number": 4
+            },
+            {
+              "u": 2,
+              "v": 3,
+              "pdg": 2,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 3,
+              "v": 9,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 6
+            }
+          ],
+          "diagram_type": "tree"
+        },
+        {
+          "nodes": [
+            {
+              "kind": "vertex",
+              "interaction_id": 40,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 63,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 1,
+              "pdg": -11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 2,
+              "pdg": 11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 3,
+              "pdg": 2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 5,
+              "pdg": 21,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 4,
+              "pdg": -2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 6,
+              "pdg": 21,
+              "state": "out"
+            }
+          ],
+          "edges": [
+            {
+              "u": 0,
+              "v": 4,
+              "pdg": -11,
+              "external": true,
+              "leg_number": 1
+            },
+            {
+              "u": 5,
+              "v": 0,
+              "pdg": 11,
+              "external": true,
+              "leg_number": 2
+            },
+            {
+              "u": 2,
+              "v": 0,
+              "pdg": -23,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 1,
+              "v": 6,
+              "pdg": 2,
+              "external": true,
+              "leg_number": 3
+            },
+            {
+              "u": 1,
+              "v": 7,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 5
+            },
+            {
+              "u": 3,
+              "v": 1,
+              "pdg": 2,
+              "external": false,
+              "leg_number": 3
+            },
+            {
+              "u": 8,
+              "v": 2,
+              "pdg": -2,
+              "external": true,
+              "leg_number": 4
+            },
+            {
+              "u": 2,
+              "v": 3,
+              "pdg": 2,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 3,
+              "v": 9,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 6
+            }
+          ],
+          "diagram_type": "tree"
+        },
+        {
+          "nodes": [
+            {
+              "kind": "vertex",
+              "interaction_id": 34,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 55,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 1,
+              "pdg": -11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 2,
+              "pdg": 11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 3,
+              "pdg": 2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 5,
+              "pdg": 21,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 4,
+              "pdg": -2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 6,
+              "pdg": 21,
+              "state": "out"
+            }
+          ],
+          "edges": [
+            {
+              "u": 0,
+              "v": 4,
+              "pdg": -11,
+              "external": true,
+              "leg_number": 1
+            },
+            {
+              "u": 5,
+              "v": 0,
+              "pdg": 11,
+              "external": true,
+              "leg_number": 2
+            },
+            {
+              "u": 3,
+              "v": 0,
+              "pdg": -22,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 1,
+              "v": 6,
+              "pdg": 2,
+              "external": true,
+              "leg_number": 3
+            },
+            {
+              "u": 1,
+              "v": 7,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 5
+            },
+            {
+              "u": 3,
+              "v": 1,
+              "pdg": 2,
+              "external": false,
+              "leg_number": 3
+            },
+            {
+              "u": 8,
+              "v": 2,
+              "pdg": -2,
+              "external": true,
+              "leg_number": 4
+            },
+            {
+              "u": 2,
+              "v": 9,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 6
+            },
+            {
+              "u": 2,
+              "v": 3,
+              "pdg": -2,
+              "external": false,
+              "leg_number": 4
+            }
+          ],
+          "diagram_type": "tree"
+        },
+        {
+          "nodes": [
+            {
+              "kind": "vertex",
+              "interaction_id": 40,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 63,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 1,
+              "pdg": -11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 2,
+              "pdg": 11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 3,
+              "pdg": 2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 5,
+              "pdg": 21,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 4,
+              "pdg": -2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 6,
+              "pdg": 21,
+              "state": "out"
+            }
+          ],
+          "edges": [
+            {
+              "u": 0,
+              "v": 4,
+              "pdg": -11,
+              "external": true,
+              "leg_number": 1
+            },
+            {
+              "u": 5,
+              "v": 0,
+              "pdg": 11,
+              "external": true,
+              "leg_number": 2
+            },
+            {
+              "u": 3,
+              "v": 0,
+              "pdg": -23,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 1,
+              "v": 6,
+              "pdg": 2,
+              "external": true,
+              "leg_number": 3
+            },
+            {
+              "u": 1,
+              "v": 7,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 5
+            },
+            {
+              "u": 3,
+              "v": 1,
+              "pdg": 2,
+              "external": false,
+              "leg_number": 3
+            },
+            {
+              "u": 8,
+              "v": 2,
+              "pdg": -2,
+              "external": true,
+              "leg_number": 4
+            },
+            {
+              "u": 2,
+              "v": 9,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 6
+            },
+            {
+              "u": 2,
+              "v": 3,
+              "pdg": -2,
+              "external": false,
+              "leg_number": 4
+            }
+          ],
+          "diagram_type": "tree"
+        },
+        {
+          "nodes": [
+            {
+              "kind": "vertex",
+              "interaction_id": 34,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 55,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 1,
+              "pdg": -11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 2,
+              "pdg": 11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 3,
+              "pdg": 2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 6,
+              "pdg": 21,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 4,
+              "pdg": -2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 5,
+              "pdg": 21,
+              "state": "out"
+            }
+          ],
+          "edges": [
+            {
+              "u": 0,
+              "v": 4,
+              "pdg": -11,
+              "external": true,
+              "leg_number": 1
+            },
+            {
+              "u": 5,
+              "v": 0,
+              "pdg": 11,
+              "external": true,
+              "leg_number": 2
+            },
+            {
+              "u": 2,
+              "v": 0,
+              "pdg": -22,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 1,
+              "v": 6,
+              "pdg": 2,
+              "external": true,
+              "leg_number": 3
+            },
+            {
+              "u": 1,
+              "v": 7,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 6
+            },
+            {
+              "u": 3,
+              "v": 1,
+              "pdg": 2,
+              "external": false,
+              "leg_number": 3
+            },
+            {
+              "u": 8,
+              "v": 2,
+              "pdg": -2,
+              "external": true,
+              "leg_number": 4
+            },
+            {
+              "u": 2,
+              "v": 3,
+              "pdg": 2,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 3,
+              "v": 9,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 5
+            }
+          ],
+          "diagram_type": "tree"
+        },
+        {
+          "nodes": [
+            {
+              "kind": "vertex",
+              "interaction_id": 40,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 63,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 1,
+              "pdg": -11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 2,
+              "pdg": 11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 3,
+              "pdg": 2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 6,
+              "pdg": 21,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 4,
+              "pdg": -2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 5,
+              "pdg": 21,
+              "state": "out"
+            }
+          ],
+          "edges": [
+            {
+              "u": 0,
+              "v": 4,
+              "pdg": -11,
+              "external": true,
+              "leg_number": 1
+            },
+            {
+              "u": 5,
+              "v": 0,
+              "pdg": 11,
+              "external": true,
+              "leg_number": 2
+            },
+            {
+              "u": 2,
+              "v": 0,
+              "pdg": -23,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 1,
+              "v": 6,
+              "pdg": 2,
+              "external": true,
+              "leg_number": 3
+            },
+            {
+              "u": 1,
+              "v": 7,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 6
+            },
+            {
+              "u": 3,
+              "v": 1,
+              "pdg": 2,
+              "external": false,
+              "leg_number": 3
+            },
+            {
+              "u": 8,
+              "v": 2,
+              "pdg": -2,
+              "external": true,
+              "leg_number": 4
+            },
+            {
+              "u": 2,
+              "v": 3,
+              "pdg": 2,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 3,
+              "v": 9,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 5
+            }
+          ],
+          "diagram_type": "tree"
+        },
+        {
+          "nodes": [
+            {
+              "kind": "vertex",
+              "interaction_id": 34,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 55,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 1,
+              "pdg": -11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 2,
+              "pdg": 11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 3,
+              "pdg": 2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 6,
+              "pdg": 21,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 4,
+              "pdg": -2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 5,
+              "pdg": 21,
+              "state": "out"
+            }
+          ],
+          "edges": [
+            {
+              "u": 0,
+              "v": 4,
+              "pdg": -11,
+              "external": true,
+              "leg_number": 1
+            },
+            {
+              "u": 5,
+              "v": 0,
+              "pdg": 11,
+              "external": true,
+              "leg_number": 2
+            },
+            {
+              "u": 3,
+              "v": 0,
+              "pdg": -22,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 1,
+              "v": 6,
+              "pdg": 2,
+              "external": true,
+              "leg_number": 3
+            },
+            {
+              "u": 1,
+              "v": 7,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 6
+            },
+            {
+              "u": 3,
+              "v": 1,
+              "pdg": 2,
+              "external": false,
+              "leg_number": 3
+            },
+            {
+              "u": 8,
+              "v": 2,
+              "pdg": -2,
+              "external": true,
+              "leg_number": 4
+            },
+            {
+              "u": 2,
+              "v": 9,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 5
+            },
+            {
+              "u": 2,
+              "v": 3,
+              "pdg": -2,
+              "external": false,
+              "leg_number": 4
+            }
+          ],
+          "diagram_type": "tree"
+        },
+        {
+          "nodes": [
+            {
+              "kind": "vertex",
+              "interaction_id": 40,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 63,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 1,
+              "pdg": -11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 2,
+              "pdg": 11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 3,
+              "pdg": 2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 6,
+              "pdg": 21,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 4,
+              "pdg": -2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 5,
+              "pdg": 21,
+              "state": "out"
+            }
+          ],
+          "edges": [
+            {
+              "u": 0,
+              "v": 4,
+              "pdg": -11,
+              "external": true,
+              "leg_number": 1
+            },
+            {
+              "u": 5,
+              "v": 0,
+              "pdg": 11,
+              "external": true,
+              "leg_number": 2
+            },
+            {
+              "u": 3,
+              "v": 0,
+              "pdg": -23,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 1,
+              "v": 6,
+              "pdg": 2,
+              "external": true,
+              "leg_number": 3
+            },
+            {
+              "u": 1,
+              "v": 7,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 6
+            },
+            {
+              "u": 3,
+              "v": 1,
+              "pdg": 2,
+              "external": false,
+              "leg_number": 3
+            },
+            {
+              "u": 8,
+              "v": 2,
+              "pdg": -2,
+              "external": true,
+              "leg_number": 4
+            },
+            {
+              "u": 2,
+              "v": 9,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 5
+            },
+            {
+              "u": 2,
+              "v": 3,
+              "pdg": -2,
+              "external": false,
+              "leg_number": 4
+            }
+          ],
+          "diagram_type": "tree"
+        },
+        {
+          "nodes": [
+            {
+              "kind": "vertex",
+              "interaction_id": 34,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 55,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 1,
+              "pdg": -11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 2,
+              "pdg": 11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 4,
+              "pdg": -2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 5,
+              "pdg": 21,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 3,
+              "pdg": 2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 6,
+              "pdg": 21,
+              "state": "out"
+            }
+          ],
+          "edges": [
+            {
+              "u": 0,
+              "v": 4,
+              "pdg": -11,
+              "external": true,
+              "leg_number": 1
+            },
+            {
+              "u": 5,
+              "v": 0,
+              "pdg": 11,
+              "external": true,
+              "leg_number": 2
+            },
+            {
+              "u": 2,
+              "v": 0,
+              "pdg": -22,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 6,
+              "v": 1,
+              "pdg": -2,
+              "external": true,
+              "leg_number": 4
+            },
+            {
+              "u": 1,
+              "v": 7,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 5
+            },
+            {
+              "u": 1,
+              "v": 3,
+              "pdg": -2,
+              "external": false,
+              "leg_number": 4
+            },
+            {
+              "u": 2,
+              "v": 8,
+              "pdg": 2,
+              "external": true,
+              "leg_number": 3
+            },
+            {
+              "u": 3,
+              "v": 2,
+              "pdg": -2,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 3,
+              "v": 9,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 6
+            }
+          ],
+          "diagram_type": "tree"
+        },
+        {
+          "nodes": [
+            {
+              "kind": "vertex",
+              "interaction_id": 40,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 63,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 1,
+              "pdg": -11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 2,
+              "pdg": 11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 4,
+              "pdg": -2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 5,
+              "pdg": 21,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 3,
+              "pdg": 2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 6,
+              "pdg": 21,
+              "state": "out"
+            }
+          ],
+          "edges": [
+            {
+              "u": 0,
+              "v": 4,
+              "pdg": -11,
+              "external": true,
+              "leg_number": 1
+            },
+            {
+              "u": 5,
+              "v": 0,
+              "pdg": 11,
+              "external": true,
+              "leg_number": 2
+            },
+            {
+              "u": 2,
+              "v": 0,
+              "pdg": -23,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 6,
+              "v": 1,
+              "pdg": -2,
+              "external": true,
+              "leg_number": 4
+            },
+            {
+              "u": 1,
+              "v": 7,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 5
+            },
+            {
+              "u": 1,
+              "v": 3,
+              "pdg": -2,
+              "external": false,
+              "leg_number": 4
+            },
+            {
+              "u": 2,
+              "v": 8,
+              "pdg": 2,
+              "external": true,
+              "leg_number": 3
+            },
+            {
+              "u": 3,
+              "v": 2,
+              "pdg": -2,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 3,
+              "v": 9,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 6
+            }
+          ],
+          "diagram_type": "tree"
+        },
+        {
+          "nodes": [
+            {
+              "kind": "vertex",
+              "interaction_id": 34,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 55,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 1,
+              "pdg": -11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 2,
+              "pdg": 11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 4,
+              "pdg": -2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 6,
+              "pdg": 21,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 3,
+              "pdg": 2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 5,
+              "pdg": 21,
+              "state": "out"
+            }
+          ],
+          "edges": [
+            {
+              "u": 0,
+              "v": 4,
+              "pdg": -11,
+              "external": true,
+              "leg_number": 1
+            },
+            {
+              "u": 5,
+              "v": 0,
+              "pdg": 11,
+              "external": true,
+              "leg_number": 2
+            },
+            {
+              "u": 2,
+              "v": 0,
+              "pdg": -22,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 6,
+              "v": 1,
+              "pdg": -2,
+              "external": true,
+              "leg_number": 4
+            },
+            {
+              "u": 1,
+              "v": 7,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 6
+            },
+            {
+              "u": 1,
+              "v": 3,
+              "pdg": -2,
+              "external": false,
+              "leg_number": 4
+            },
+            {
+              "u": 2,
+              "v": 8,
+              "pdg": 2,
+              "external": true,
+              "leg_number": 3
+            },
+            {
+              "u": 3,
+              "v": 2,
+              "pdg": -2,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 3,
+              "v": 9,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 5
+            }
+          ],
+          "diagram_type": "tree"
+        },
+        {
+          "nodes": [
+            {
+              "kind": "vertex",
+              "interaction_id": 40,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 63,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 1,
+              "pdg": -11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 2,
+              "pdg": 11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 4,
+              "pdg": -2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 6,
+              "pdg": 21,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 3,
+              "pdg": 2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 5,
+              "pdg": 21,
+              "state": "out"
+            }
+          ],
+          "edges": [
+            {
+              "u": 0,
+              "v": 4,
+              "pdg": -11,
+              "external": true,
+              "leg_number": 1
+            },
+            {
+              "u": 5,
+              "v": 0,
+              "pdg": 11,
+              "external": true,
+              "leg_number": 2
+            },
+            {
+              "u": 2,
+              "v": 0,
+              "pdg": -23,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 6,
+              "v": 1,
+              "pdg": -2,
+              "external": true,
+              "leg_number": 4
+            },
+            {
+              "u": 1,
+              "v": 7,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 6
+            },
+            {
+              "u": 1,
+              "v": 3,
+              "pdg": -2,
+              "external": false,
+              "leg_number": 4
+            },
+            {
+              "u": 2,
+              "v": 8,
+              "pdg": 2,
+              "external": true,
+              "leg_number": 3
+            },
+            {
+              "u": 3,
+              "v": 2,
+              "pdg": -2,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 3,
+              "v": 9,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 5
+            }
+          ],
+          "diagram_type": "tree"
+        },
+        {
+          "nodes": [
+            {
+              "kind": "vertex",
+              "interaction_id": 34,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 3,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 55,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 1,
+              "pdg": -11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 2,
+              "pdg": 11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 5,
+              "pdg": 21,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 6,
+              "pdg": 21,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 3,
+              "pdg": 2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 4,
+              "pdg": -2,
+              "state": "out"
+            }
+          ],
+          "edges": [
+            {
+              "u": 0,
+              "v": 4,
+              "pdg": -11,
+              "external": true,
+              "leg_number": 1
+            },
+            {
+              "u": 5,
+              "v": 0,
+              "pdg": 11,
+              "external": true,
+              "leg_number": 2
+            },
+            {
+              "u": 2,
+              "v": 0,
+              "pdg": -22,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 1,
+              "v": 6,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 5
+            },
+            {
+              "u": 1,
+              "v": 7,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 6
+            },
+            {
+              "u": 3,
+              "v": 1,
+              "pdg": 21,
+              "external": false,
+              "leg_number": 5
+            },
+            {
+              "u": 2,
+              "v": 8,
+              "pdg": 2,
+              "external": true,
+              "leg_number": 3
+            },
+            {
+              "u": 3,
+              "v": 2,
+              "pdg": -2,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 9,
+              "v": 3,
+              "pdg": -2,
+              "external": true,
+              "leg_number": 4
+            }
+          ],
+          "diagram_type": "tree"
+        },
+        {
+          "nodes": [
+            {
+              "kind": "vertex",
+              "interaction_id": 34,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 3,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 55,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 1,
+              "pdg": -11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 2,
+              "pdg": 11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 5,
+              "pdg": 21,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 6,
+              "pdg": 21,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 4,
+              "pdg": -2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 3,
+              "pdg": 2,
+              "state": "out"
+            }
+          ],
+          "edges": [
+            {
+              "u": 0,
+              "v": 4,
+              "pdg": -11,
+              "external": true,
+              "leg_number": 1
+            },
+            {
+              "u": 5,
+              "v": 0,
+              "pdg": 11,
+              "external": true,
+              "leg_number": 2
+            },
+            {
+              "u": 2,
+              "v": 0,
+              "pdg": -22,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 1,
+              "v": 6,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 5
+            },
+            {
+              "u": 1,
+              "v": 7,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 6
+            },
+            {
+              "u": 3,
+              "v": 1,
+              "pdg": 21,
+              "external": false,
+              "leg_number": 5
+            },
+            {
+              "u": 8,
+              "v": 2,
+              "pdg": -2,
+              "external": true,
+              "leg_number": 4
+            },
+            {
+              "u": 2,
+              "v": 3,
+              "pdg": 2,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 3,
+              "v": 9,
+              "pdg": 2,
+              "external": true,
+              "leg_number": 3
+            }
+          ],
+          "diagram_type": "tree"
+        },
+        {
+          "nodes": [
+            {
+              "kind": "vertex",
+              "interaction_id": 40,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 3,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 63,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 1,
+              "pdg": -11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 2,
+              "pdg": 11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 5,
+              "pdg": 21,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 6,
+              "pdg": 21,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 3,
+              "pdg": 2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 4,
+              "pdg": -2,
+              "state": "out"
+            }
+          ],
+          "edges": [
+            {
+              "u": 0,
+              "v": 4,
+              "pdg": -11,
+              "external": true,
+              "leg_number": 1
+            },
+            {
+              "u": 5,
+              "v": 0,
+              "pdg": 11,
+              "external": true,
+              "leg_number": 2
+            },
+            {
+              "u": 2,
+              "v": 0,
+              "pdg": -23,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 1,
+              "v": 6,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 5
+            },
+            {
+              "u": 1,
+              "v": 7,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 6
+            },
+            {
+              "u": 3,
+              "v": 1,
+              "pdg": 21,
+              "external": false,
+              "leg_number": 5
+            },
+            {
+              "u": 2,
+              "v": 8,
+              "pdg": 2,
+              "external": true,
+              "leg_number": 3
+            },
+            {
+              "u": 3,
+              "v": 2,
+              "pdg": -2,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 9,
+              "v": 3,
+              "pdg": -2,
+              "external": true,
+              "leg_number": 4
+            }
+          ],
+          "diagram_type": "tree"
+        },
+        {
+          "nodes": [
+            {
+              "kind": "vertex",
+              "interaction_id": 40,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 3,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 63,
+              "orders": {
+                "QED": 1
+              }
+            },
+            {
+              "kind": "vertex",
+              "interaction_id": 58,
+              "orders": {
+                "QCD": 1
+              }
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 1,
+              "pdg": -11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 2,
+              "pdg": 11,
+              "state": "in"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 5,
+              "pdg": 21,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 6,
+              "pdg": 21,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 4,
+              "pdg": -2,
+              "state": "out"
+            },
+            {
+              "kind": "external",
+              "interaction_id": 0,
+              "leg_number": 3,
+              "pdg": 2,
+              "state": "out"
+            }
+          ],
+          "edges": [
+            {
+              "u": 0,
+              "v": 4,
+              "pdg": -11,
+              "external": true,
+              "leg_number": 1
+            },
+            {
+              "u": 5,
+              "v": 0,
+              "pdg": 11,
+              "external": true,
+              "leg_number": 2
+            },
+            {
+              "u": 2,
+              "v": 0,
+              "pdg": -23,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 1,
+              "v": 6,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 5
+            },
+            {
+              "u": 1,
+              "v": 7,
+              "pdg": 21,
+              "external": true,
+              "leg_number": 6
+            },
+            {
+              "u": 3,
+              "v": 1,
+              "pdg": 21,
+              "external": false,
+              "leg_number": 5
+            },
+            {
+              "u": 8,
+              "v": 2,
+              "pdg": -2,
+              "external": true,
+              "leg_number": 4
+            },
+            {
+              "u": 2,
+              "v": 3,
+              "pdg": 2,
+              "external": false,
+              "leg_number": 1
+            },
+            {
+              "u": 3,
+              "v": 9,
+              "pdg": 2,
+              "external": true,
+              "leg_number": 3
+            }
+          ],
+          "diagram_type": "tree"
+        }
+      ]
+    }
+  ]
+}
